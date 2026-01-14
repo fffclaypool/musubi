@@ -1,0 +1,9 @@
+[package]
+name = "musubi"
+version = "0.1.0"
+edition = "2021"
+description = "A minimal HNSW (Hierarchical Navigable Small World) implementation"
+
+[dependencies]
+rand = "0.8"
+ordered-float = "4.2"
