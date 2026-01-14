@@ -1,0 +1,25 @@
+{
+  "name": "Musubi (Rust Dev)",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+  "postCreateCommand": "claude --version && cargo --version",
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "lldb.executable": "/usr/bin/lldb",
+        "files.watcherExclude": {
+          "**/target/**": true
+        }
+      },
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "vadimcn.vscode-lldb",
+        "tamasfe.even-better-toml",
+        "serayuzgur.crates",
+        "usernamehw.errorlens"
+      ]
+    }
+  },
+  "remoteUser": "vscode"
+}
