@@ -1,4 +1,4 @@
-use musubi::HnswIndex;
+use musubi::{load_with_wal, HnswIndex, WalWriter};
 use rand::Rng;
 use std::fs;
 use std::io;
@@ -15,6 +15,26 @@ fn normalize(vector: &[f32]) -> Option<Vec<f32>> {
 
 fn main() -> io::Result<()> {
     println!("=== HNSW Index Demo ===\n");
+
+    // WAL追記 -> 復元の簡易デモ
+    let wal_path = Path::new("hnsw.wal");
+    let snapshot_path = Path::new("hnsw.bin");
+    if wal_path.exists() {
+        fs::remove_file(wal_path)?;
+    }
+    if snapshot_path.exists() {
+        fs::remove_file(snapshot_path)?;
+    }
+
+    let mut wal = WalWriter::new(wal_path)?;
+    let mut index = load_with_wal(snapshot_path, wal_path, 16, 200)?;
+    index.insert_with_wal(vec![1.0, 0.0, 0.0], &mut wal)?;
+    index.insert_with_wal(vec![0.0, 1.0, 0.0], &mut wal)?;
+    index.save(snapshot_path)?;
+
+    let recovered = load_with_wal(snapshot_path, wal_path, 16, 200)?;
+    let demo_results = recovered.search(&[1.0, 0.0, 0.0], 1, 10);
+    println!("WAL復元デモ結果: {:?}", demo_results);
 
     // パラメータ
     let dimensions = 1536;
