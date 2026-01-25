@@ -1,4 +1,4 @@
-use crate::index::hnsw::HnswIndex;
+use crate::infrastructure::index::hnsw::HnswIndex;
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::Path;

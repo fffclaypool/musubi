@@ -1,8 +1,8 @@
-use crate::index::metrics::{cosine_distance, normalize};
-use crate::index::neighbor::select_neighbors_heuristic;
-use crate::storage::file as storage_file;
-use crate::storage::wal::WalWriter;
-use crate::types::{SearchResult, Vector};
+use crate::domain::types::{SearchResult, Vector};
+use crate::infrastructure::index::metrics::{cosine_distance, normalize};
+use crate::infrastructure::index::neighbor::select_neighbors_heuristic;
+use crate::infrastructure::storage::file as storage_file;
+use crate::infrastructure::storage::wal::WalWriter;
 use ordered_float::OrderedFloat;
 use rand::Rng;
 use std::collections::{BinaryHeap, HashSet};
@@ -62,6 +62,16 @@ impl HnswIndex {
     /// インデックス内のベクトル数を取得する
     pub fn len(&self) -> usize {
         self.vectors.len()
+    }
+
+    /// インデックスに保存されたベクトルを取得する
+    pub fn vector(&self, id: usize) -> Option<&Vector> {
+        self.vectors.get(id)
+    }
+
+    /// 次元数を取得する
+    pub fn dim(&self) -> usize {
+        self.dim
     }
 
     /// インデックスが空かどうかを確認する

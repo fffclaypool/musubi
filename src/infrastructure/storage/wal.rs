@@ -1,6 +1,5 @@
-use crate::index::hnsw::HnswIndex;
-use crate::storage::file as storage_file;
-use crate::types::Vector;
+use crate::infrastructure::index::hnsw::HnswIndex;
+use crate::infrastructure::storage::file as storage_file;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::Path;

@@ -1,5 +1,5 @@
-use crate::index::metrics::cosine_distance;
-use crate::types::Vector;
+use crate::domain::types::Vector;
+use crate::infrastructure::index::metrics::cosine_distance;
 
 /// 多様性を保つヒューリスティックで近傍を選択
 pub fn select_neighbors_heuristic(

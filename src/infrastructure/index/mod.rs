@@ -1,3 +1,4 @@
+pub mod adapter;
 pub mod hnsw;
 pub mod metrics;
 pub mod neighbor;

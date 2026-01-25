@@ -13,8 +13,8 @@ RUN apt-get update && export DEBIAN_FRONTEND=noninteractive \
     python3-pip \
     && apt-get clean -y && rm -rf /var/lib/apt/lists/*
 
-RUN python3 -m pip install --upgrade pip \
-    && python3 -m pip install uv
+ENV UV_INSTALL_DIR="/usr/local/bin"
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 
 RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y nodejs \
