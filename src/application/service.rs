@@ -1,8 +1,9 @@
 use crate::application::error::AppError;
 use crate::domain::model::{Record, StoredRecord};
 use crate::domain::ports::{Embedder, RecordStore, VectorIndex, VectorIndexFactory};
-use std::path::PathBuf;
+use serde::Serialize;
 use std::collections::HashSet;
+use std::path::PathBuf;
 
 pub struct ServiceConfig {
     pub snapshot_path: PathBuf,
@@ -45,7 +46,7 @@ pub struct SearchCommand {
     pub ef: Option<usize>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct SearchHit {
     pub index_id: usize,
     pub id: String,
@@ -55,22 +56,24 @@ pub struct SearchHit {
     pub tags: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct InsertResult {
     pub index_id: usize,
     pub id: String,
     pub dim: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct DocumentSummary {
     pub index_id: usize,
+    #[serde(flatten)]
     pub record: Record,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct DocumentResponse {
     pub index_id: usize,
+    #[serde(flatten)]
     pub record: Record,
     pub embedding: Vec<f32>,
 }
@@ -82,12 +85,8 @@ impl DocumentService {
         record_store: Box<dyn RecordStore>,
         index_factory: Box<dyn VectorIndexFactory>,
     ) -> Result<Self, AppError> {
-        let mut records = record_store
-            .load()
-            .map_err(|err| AppError::Io(err.to_string()))?;
-        let index = index_factory
-            .load_or_create(&config.snapshot_path, &records)
-            .map_err(|err| AppError::Io(err.to_string()))?;
+        let mut records = record_store.load()?;
+        let index = index_factory.load_or_create(&config.snapshot_path, &records)?;
 
         let updated = fill_missing_embeddings(&mut records, index.as_ref());
         if updated {
@@ -128,14 +127,7 @@ impl DocumentService {
 
         let text = build_text(cmd.text.as_deref(), &cmd.record)
             .ok_or_else(|| AppError::BadRequest("text/title/body is required".to_string()))?;
-        let embeddings = self
-            .embedder
-            .embed(vec![text])
-            .map_err(|err| AppError::Io(err.to_string()))?;
-        let embedding = embeddings
-            .into_iter()
-            .next()
-            .ok_or_else(|| AppError::Io("embedding response is empty".to_string()))?;
+        let embedding = self.embed_single(text)?;
 
         let index_id = self.index.insert(embedding.clone());
         let stored = StoredRecord {
@@ -143,12 +135,8 @@ impl DocumentService {
             embedding: embedding.clone(),
         };
         self.records.push(stored.clone());
-        self.index
-            .save(&self.snapshot_path)
-            .map_err(|err| AppError::Io(err.to_string()))?;
-        self.record_store
-            .append(&stored)
-            .map_err(|err| AppError::Io(err.to_string()))?;
+        self.index.save(&self.snapshot_path)?;
+        self.record_store.append(&stored)?;
 
         Ok(InsertResult {
             index_id,
@@ -158,50 +146,31 @@ impl DocumentService {
     }
 
     pub fn update(&mut self, id: &str, cmd: UpdateCommand) -> Result<DocumentResponse, AppError> {
-        let index_id = self
-            .records
-            .iter()
-            .position(|record| record.record.id == id)
-            .ok_or_else(|| AppError::NotFound("record not found".to_string()))?;
-
+        let index_id = self.find_index(id)?;
         let current = self.records[index_id].clone();
-        let mut updated = current.record.clone();
-        if cmd.title.is_some() {
-            updated.title = cmd.title.clone();
-        }
-        if cmd.body.is_some() {
-            updated.body = cmd.body.clone();
-        }
-        if cmd.source.is_some() {
-            updated.source = cmd.source.clone();
-        }
-        if cmd.updated_at.is_some() {
-            updated.updated_at = cmd.updated_at.clone();
-        }
-        if cmd.tags.is_some() {
-            updated.tags = cmd.tags.clone();
-        }
 
         let needs_embedding = cmd.text.is_some() || cmd.title.is_some() || cmd.body.is_some();
+        let updated = Record {
+            id: current.record.id.clone(),
+            title: cmd.title.or(current.record.title),
+            body: cmd.body.or(current.record.body),
+            source: cmd.source.or(current.record.source),
+            updated_at: cmd.updated_at.or(current.record.updated_at),
+            tags: cmd.tags.or(current.record.tags),
+        };
+
         let embedding = if needs_embedding {
-            let text = if let Some(text) = cmd.text.as_ref() {
+            let text = if let Some(text) = cmd.text {
                 if text.trim().is_empty() {
                     return Err(AppError::BadRequest("text must not be empty".to_string()));
                 }
-                text.to_string()
+                text
             } else {
                 build_text(None, &updated).ok_or_else(|| {
                     AppError::BadRequest("title/body is required to build embedding".to_string())
                 })?
             };
-            let embeddings = self
-                .embedder
-                .embed(vec![text])
-                .map_err(|err| AppError::Io(err.to_string()))?;
-            embeddings
-                .into_iter()
-                .next()
-                .ok_or_else(|| AppError::Io("embedding response is empty".to_string()))?
+            self.embed_single(text)?
         } else {
             current.embedding.clone()
         };
@@ -220,11 +189,7 @@ impl DocumentService {
     }
 
     pub fn delete(&mut self, id: &str) -> Result<(), AppError> {
-        let index_id = self
-            .records
-            .iter()
-            .position(|record| record.record.id == id)
-            .ok_or_else(|| AppError::NotFound("record not found".to_string()))?;
+        let index_id = self.find_index(id)?;
         self.records.remove(index_id);
         self.rebuild_index()?;
         Ok(())
@@ -236,14 +201,7 @@ impl DocumentService {
         let embedding = if let Some(embedding) = cmd.embedding {
             embedding
         } else if let Some(text) = cmd.text {
-            let embeddings = self
-                .embedder
-                .embed(vec![text])
-                .map_err(|err| AppError::Io(err.to_string()))?;
-            embeddings
-                .into_iter()
-                .next()
-                .ok_or_else(|| AppError::Io("embedding response is empty".to_string()))?
+            self.embed_single(text)?
         } else {
             return Err(AppError::BadRequest("text or embedding is required".to_string()));
         };
@@ -266,11 +224,7 @@ impl DocumentService {
     }
 
     pub fn get(&self, id: &str) -> Result<DocumentResponse, AppError> {
-        let index_id = self
-            .records
-            .iter()
-            .position(|record| record.record.id == id)
-            .ok_or_else(|| AppError::NotFound("record not found".to_string()))?;
+        let index_id = self.find_index(id)?;
         let stored = self.records[index_id].clone();
         Ok(DocumentResponse {
             index_id,
@@ -340,20 +294,29 @@ impl DocumentService {
         if texts.is_empty() {
             return Err(AppError::BadRequest("texts is required".to_string()));
         }
-        self.embedder
-            .embed(texts)
-            .map_err(|err| AppError::Io(err.to_string()))
+        Ok(self.embedder.embed(texts)?)
     }
 
     fn rebuild_index(&mut self) -> Result<(), AppError> {
         self.index = self.index_factory.rebuild(&self.records);
-        self.index
-            .save(&self.snapshot_path)
-            .map_err(|err| AppError::Io(err.to_string()))?;
-        self.record_store
-            .save_all(&self.records)
-            .map_err(|err| AppError::Io(err.to_string()))?;
+        self.index.save(&self.snapshot_path)?;
+        self.record_store.save_all(&self.records)?;
         Ok(())
+    }
+
+    fn find_index(&self, id: &str) -> Result<usize, AppError> {
+        self.records
+            .iter()
+            .position(|record| record.record.id == id)
+            .ok_or_else(|| AppError::NotFound("record not found".to_string()))
+    }
+
+    fn embed_single(&self, text: String) -> Result<Vec<f32>, AppError> {
+        self.embedder
+            .embed(vec![text])?
+            .into_iter()
+            .next()
+            .ok_or_else(|| AppError::Io("embedding response is empty".to_string()))
     }
 }
 
