@@ -35,7 +35,7 @@ impl Embedder for PythonEmbedder {
             return Ok(Vec::new());
         }
         let mut child = Command::new(&self.python_bin)
-            .arg("scripts/embed_text.py")
+            .arg("python/embed_text.py")
             .arg("--model")
             .arg(&self.model)
             .stdin(Stdio::piped())
