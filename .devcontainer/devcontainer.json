@@ -3,7 +3,7 @@
   "build": {
     "dockerfile": "Dockerfile"
   },
-  "postCreateCommand": "claude --version && cargo --version",
+  "postCreateCommand": "claude --version && cargo --version && python3 --version && uv --version && uv sync",
   "customizations": {
     "vscode": {
       "settings": {
@@ -17,7 +17,9 @@
         "vadimcn.vscode-lldb",
         "tamasfe.even-better-toml",
         "serayuzgur.crates",
-        "usernamehw.errorlens"
+        "usernamehw.errorlens",
+        "ms-python.python",
+        "ms-python.vscode-pylance"
       ]
     }
   },

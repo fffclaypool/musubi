@@ -1,0 +1,11 @@
+[project]
+name = "musubi"
+version = "0.1.0"
+description = "Python dependencies for embedding tools"
+requires-python = ">=3.10"
+dependencies = [
+  "sentence-transformers==2.7.0",
+]
+
+[tool.uv]
+dev-dependencies = []

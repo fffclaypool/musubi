@@ -1,0 +1,4 @@
+id,title,body,source,updated_at,tags
+1,商品レビュー,"この商品はとても良かった。品質が高く、配送も早かった。",https://example.com/item/1,2024-01-01T00:00:00Z,review|jp
+2,お知らせ,"新機能をリリースしました。詳細は公式サイトをご覧ください。",https://example.com/news/2,2024-02-01T00:00:00Z,news|jp
+3,FAQ,"返品は到着後30日以内に受け付けています。",https://example.com/faq/3,2024-03-01T00:00:00Z,faq|jp

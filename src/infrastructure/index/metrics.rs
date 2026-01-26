@@ -1,4 +1,4 @@
-use crate::types::Vector;
+use crate::domain::types::Vector;
 
 /// コサイン距離を計算する (ベクトルは正規化済み前提)
 pub fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {

@@ -8,7 +8,13 @@ RUN apt-get update && export DEBIAN_FRONTEND=noninteractive \
     lldb \
     curl \
     gnupg \
+    python3 \
+    python3-venv \
+    python3-pip \
     && apt-get clean -y && rm -rf /var/lib/apt/lists/*
+
+ENV UV_INSTALL_DIR="/usr/local/bin"
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 
 RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y nodejs \
