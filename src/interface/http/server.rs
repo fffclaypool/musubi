@@ -1,7 +1,7 @@
 use crate::application::error::AppError;
 use crate::application::service::{
-    DocumentResponse as AppDocumentResponse, DocumentService, InsertCommand, SearchCommand,
-    UpdateCommand,
+    DocumentResponse, DocumentService, DocumentSummary, InsertCommand, InsertResult, SearchCommand,
+    SearchHit, UpdateCommand,
 };
 use crate::domain::model::Record;
 use axum::{
@@ -62,43 +62,13 @@ struct ListQuery {
 }
 
 #[derive(Debug, Serialize)]
-struct InsertResponse {
-    index_id: usize,
-    id: String,
-    dim: usize,
-}
-
-#[derive(Debug, Serialize)]
 struct EmbedResponse {
     embeddings: Vec<Vec<f32>>,
 }
 
 #[derive(Debug, Serialize)]
-struct SearchHit {
-    index_id: usize,
-    id: String,
-    distance: f32,
-    title: Option<String>,
-    source: Option<String>,
-    tags: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
 struct SearchResponse {
     results: Vec<SearchHit>,
-}
-
-#[derive(Debug, Serialize)]
-struct DocumentResponse {
-    index_id: usize,
-    record: Record,
-    embedding: Vec<f32>,
-}
-
-#[derive(Debug, Serialize)]
-struct DocumentSummary {
-    index_id: usize,
-    record: Record,
 }
 
 #[derive(Debug, Serialize)]
@@ -146,7 +116,7 @@ impl IntoResponse for ApiError {
 async fn insert_handler(
     State(state): State<AppState>,
     Json(req): Json<InsertRequest>,
-) -> Result<Json<InsertResponse>, ApiError> {
+) -> Result<Json<InsertResult>, ApiError> {
     let record = Record {
         id: req.id,
         title: req.title,
@@ -171,11 +141,7 @@ async fn insert_handler(
         message: format!("join error: {}", err),
     })??;
 
-    Ok(Json(InsertResponse {
-        index_id: result.index_id,
-        id: result.id,
-        dim: result.dim,
-    }))
+    Ok(Json(result))
 }
 
 async fn update_handler(
@@ -203,7 +169,7 @@ async fn update_handler(
         message: format!("join error: {}", err),
     })??;
 
-    Ok(Json(to_document_response(result)))
+    Ok(Json(result))
 }
 
 async fn delete_handler(
@@ -246,19 +212,7 @@ async fn search_handler(
         message: format!("join error: {}", err),
     })??;
 
-    let hits = results
-        .into_iter()
-        .map(|hit| SearchHit {
-            index_id: hit.index_id,
-            id: hit.id,
-            distance: hit.distance,
-            title: hit.title,
-            source: hit.source,
-            tags: hit.tags,
-        })
-        .collect();
-
-    Ok(Json(SearchResponse { results: hits }))
+    Ok(Json(SearchResponse { results }))
 }
 
 async fn embed_handler(
@@ -294,7 +248,7 @@ async fn get_document_handler(
         message: format!("join error: {}", err),
     })??;
 
-    Ok(Json(to_document_response(result)))
+    Ok(Json(result))
 }
 
 async fn list_documents_handler(
@@ -315,27 +269,11 @@ async fn list_documents_handler(
         message: format!("join error: {}", err),
     })?;
 
-    let items = items
-        .into_iter()
-        .map(|item| DocumentSummary {
-            index_id: item.index_id,
-            record: item.record,
-        })
-        .collect();
-
     Ok(Json(ListResponse { total, items }))
 }
 
 async fn health_handler() -> &'static str {
     "ok"
-}
-
-fn to_document_response(doc: AppDocumentResponse) -> DocumentResponse {
-    DocumentResponse {
-        index_id: doc.index_id,
-        record: doc.record,
-        embedding: doc.embedding,
-    }
 }
 
 pub async fn serve(addr: String, service: DocumentService) -> io::Result<()> {

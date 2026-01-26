@@ -1,4 +1,5 @@
 use std::fmt;
+use std::io;
 
 #[derive(Debug)]
 pub enum AppError {
@@ -16,5 +17,11 @@ impl fmt::Display for AppError {
             AppError::Conflict(message) => write!(f, "conflict: {}", message),
             AppError::Io(message) => write!(f, "io error: {}", message),
         }
+    }
+}
+
+impl From<io::Error> for AppError {
+    fn from(err: io::Error) -> Self {
+        AppError::Io(err.to_string())
     }
 }
