@@ -284,6 +284,86 @@ MUSUBI_WAL_ENABLED=false cargo run --release
 - すべてのベクトルは挿入時に正規化されます (ゼロベクトル不可)
 - 次元は最初の挿入ベクトルで固定され、以降は一致が必要です
 
+## ベンチマーク (ANN-Benchmarks)
+
+ANN-Benchmarks の標準データセットを使って Recall@k とレイテンシを測定できます。
+
+### データ取得
+
+```bash
+# glove-100-angular (デフォルト、約463MB)
+./scripts/download_ann_data.sh
+
+# または手動で
+mkdir -p data/ann
+wget -O data/ann/glove-100-angular.hdf5 http://ann-benchmarks.com/glove-100-angular.hdf5
+```
+
+### ベンチマーク実行
+
+```bash
+# フルデータセット (1.2M train, 10k test)
+cargo run --release --bin bench_ann -- \
+    --dataset data/ann/glove-100-angular.hdf5
+
+# 10k サブセット (高速、brute-force で正解近傍を再計算)
+cargo run --release --bin bench_ann -- \
+    --dataset data/ann/glove-100-angular.hdf5 \
+    --train-limit 10000 \
+    --test-limit 1000
+
+# パラメータ調整
+cargo run --release --bin bench_ann -- \
+    --dataset data/ann/glove-100-angular.hdf5 \
+    --train-limit 10000 \
+    --test-limit 1000 \
+    --m 32 \
+    --ef-construction 400 \
+    --ef 200 \
+    --k 10 \
+    --save-index
+```
+
+### オプション
+
+| オプション | 説明 | デフォルト |
+|-----------|------|-----------|
+| `--dataset` | HDF5ファイルパス | (必須) |
+| `--k` | 取得する近傍数 | 10 |
+| `--ef` | 検索時の探索幅 | 100 |
+| `--m` | HNSW M パラメータ | 16 |
+| `--ef-construction` | 構築時の探索幅 | 200 |
+| `--train-limit` | 訓練ベクトル数の上限 | (全件) |
+| `--test-limit` | テストクエリ数の上限 | (全件) |
+| `--output` | 結果出力ディレクトリ | data/bench |
+| `--save-index` | インデックスサイズを計測 | false |
+
+### 出力例 (JSON)
+
+```json
+{
+  "dataset": "glove-100-angular",
+  "train": 10000,
+  "test": 1000,
+  "k": 10,
+  "m": 16,
+  "ef_construction": 200,
+  "ef_search": 100,
+  "build_time_ms": 1234,
+  "avg_ms": 1.5,
+  "p50_ms": 1.2,
+  "p95_ms": 3.4,
+  "p99_ms": 5.1,
+  "recall_at_k": 0.92,
+  "index_size_bytes": 12345678
+}
+```
+
+### 注意事項
+
+- **サブセット時の正解近傍**: `--train-limit` を指定した場合、HDF5 の neighbors はフルデータセット用なので、brute-force で正解近傍を再計算します
+- **cosine/angular**: glove-100-angular はコサイン類似度前提。ベクトルは自動で正規化されます
+
 ## テスト
 
 ```bash
