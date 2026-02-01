@@ -1,5 +1,5 @@
 use musubi::application::error::AppError;
-use musubi::application::service::{DocumentService, ServiceConfig};
+use musubi::application::service::{DocumentService, ServiceConfig, TombstoneConfig};
 use musubi::domain::ports::Embedder;
 use musubi::infrastructure::embedding::http::HttpEmbedder;
 use musubi::infrastructure::embedding::python::PythonEmbedder;
@@ -54,11 +54,41 @@ async fn main() -> io::Result<()> {
         }
     };
 
+    // Tombstone configuration
+    let tombstone_config = {
+        let max_tombstones = std::env::var("MUSUBI_TOMBSTONE_MAX_COUNT")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok());
+
+        let max_ratio = std::env::var("MUSUBI_TOMBSTONE_MAX_RATIO")
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok());
+
+        if max_tombstones.is_some() || max_ratio.is_some() {
+            println!("Tombstone compaction:");
+            if let Some(max) = max_tombstones {
+                println!("  max_count: {}", max);
+            }
+            if let Some(ratio) = max_ratio {
+                println!("  max_ratio: {:.1}%", ratio * 100.0);
+            }
+            TombstoneConfig {
+                max_tombstones,
+                max_tombstone_ratio: max_ratio,
+            }
+        } else {
+            // Use default (30% ratio)
+            println!("Tombstone compaction: default (30% ratio)");
+            TombstoneConfig::default()
+        }
+    };
+
     let config = ServiceConfig {
         snapshot_path,
         default_k: 5,
         default_ef: 100,
         wal_config,
+        tombstone_config,
     };
 
     let embedder: Box<dyn Embedder> = if let Ok(url) = std::env::var("MUSUBI_EMBED_URL") {

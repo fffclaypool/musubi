@@ -5,29 +5,43 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
+const MAGIC_V3: &[u8; 8] = b"MUSUBIW3";
 const MAGIC_V2: &[u8; 8] = b"MUSUBIW2";
 const MAGIC_V1: &[u8; 8] = b"MUSUBIW1";
-const VERSION: u32 = 2;
+const VERSION: u32 = 3;
 
 const OP_INSERT: u8 = 1;
 const OP_UPDATE: u8 = 2;
 const OP_DELETE: u8 = 3;
+const OP_APPEND: u8 = 4;
 
 /// WAL operation for replay
 #[derive(Debug, Clone)]
 pub enum WalOp {
+    /// Insert a new record (upsert: replaces if ID exists)
     Insert {
         id: String,
         record: Record,
         embedding: Vec<f32>,
+        deleted: bool,
     },
+    /// Update an existing record (upsert: replaces if ID exists)
     Update {
         id: String,
         record: Record,
         embedding: Vec<f32>,
+        deleted: bool,
     },
+    /// Mark a record as deleted (tombstone)
     Delete {
         id: String,
+    },
+    /// Append a new record (for tombstone-append pattern, idempotent)
+    Append {
+        id: String,
+        record: Record,
+        embedding: Vec<f32>,
+        deleted: bool,
     },
 }
 
@@ -65,22 +79,24 @@ impl WalWriter {
             let mut magic = [0u8; 8];
             reader.read_exact(&mut magic)?;
 
-            if &magic == MAGIC_V1 {
-                // V1 WAL detected - cannot auto-migrate because v1 only stored vectors
-                // without record metadata. User must verify records.jsonl is complete
-                // and manually delete the v1 WAL file.
+            if &magic == MAGIC_V1 || &magic == MAGIC_V2 {
+                // V1/V2 WAL detected - cannot auto-migrate.
+                // V1: only stored vectors without record metadata.
+                // V2: no deleted flag, format incompatible with v3.
+                // User must verify records.jsonl is complete and manually delete the WAL file.
+                let version_str = if &magic == MAGIC_V1 { "v1" } else { "v2" };
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
-                        "WAL v1 detected at {:?}. V1 format cannot be replayed (no record metadata). \
+                        "WAL {} detected at {:?}. This format cannot be replayed. \
                          Please verify records.jsonl is complete, then delete the WAL file to proceed.",
-                        path
+                        version_str, path
                     ),
                 ));
-            } else if &magic != MAGIC_V2 {
+            } else if &magic != MAGIC_V3 {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    format!("invalid wal magic: expected {:?}, got {:?}", MAGIC_V2, magic),
+                    format!("invalid wal magic: expected {:?}, got {:?}", MAGIC_V3, magic),
                 ));
             }
 
@@ -99,7 +115,7 @@ impl WalWriter {
         let mut writer = BufWriter::new(file);
 
         if path.metadata()?.len() == 0 {
-            writer.write_all(MAGIC_V2)?;
+            writer.write_all(MAGIC_V3)?;
             write_u32(&mut writer, VERSION)?;
             writer.flush()?;
         }
@@ -117,6 +133,7 @@ impl WalWriter {
         write_string(&mut self.writer, &stored.record.id)?;
         write_record(&mut self.writer, &stored.record)?;
         write_embedding(&mut self.writer, &stored.embedding)?;
+        write_bool(&mut self.writer, stored.deleted)?;
         self.writer.flush()?;
         self.writer.get_ref().sync_data()?;
         self.record_count += 1;
@@ -129,6 +146,7 @@ impl WalWriter {
         write_string(&mut self.writer, &stored.record.id)?;
         write_record(&mut self.writer, &stored.record)?;
         write_embedding(&mut self.writer, &stored.embedding)?;
+        write_bool(&mut self.writer, stored.deleted)?;
         self.writer.flush()?;
         self.writer.get_ref().sync_data()?;
         self.record_count += 1;
@@ -139,6 +157,19 @@ impl WalWriter {
     pub fn append_delete(&mut self, id: &str) -> io::Result<()> {
         self.writer.write_all(&[OP_DELETE])?;
         write_string(&mut self.writer, id)?;
+        self.writer.flush()?;
+        self.writer.get_ref().sync_data()?;
+        self.record_count += 1;
+        Ok(())
+    }
+
+    /// Append an APPEND operation to WAL (for tombstone-append pattern)
+    pub fn append_append(&mut self, stored: &StoredRecord) -> io::Result<()> {
+        self.writer.write_all(&[OP_APPEND])?;
+        write_string(&mut self.writer, &stored.record.id)?;
+        write_record(&mut self.writer, &stored.record)?;
+        write_embedding(&mut self.writer, &stored.embedding)?;
+        write_bool(&mut self.writer, stored.deleted)?;
         self.writer.flush()?;
         self.writer.get_ref().sync_data()?;
         self.record_count += 1;
@@ -187,7 +218,7 @@ impl WalWriter {
             .truncate(true)
             .open(&self.path)?;
         let mut writer = BufWriter::new(file);
-        writer.write_all(MAGIC_V2)?;
+        writer.write_all(MAGIC_V3)?;
         write_u32(&mut writer, VERSION)?;
         writer.flush()?;
         writer.get_ref().sync_data()?;
@@ -213,21 +244,24 @@ pub fn replay<P: AsRef<Path>>(path: P) -> io::Result<Vec<WalOp>> {
     let mut magic = [0u8; 8];
     reader.read_exact(&mut magic)?;
 
-    if &magic == MAGIC_V1 {
-        // V1 WAL cannot be replayed (no record metadata).
+    if &magic == MAGIC_V1 || &magic == MAGIC_V2 {
+        // V1/V2 WAL cannot be replayed.
+        // V1: only stored vectors without record metadata.
+        // V2: no deleted flag, format incompatible with v3.
         // User must verify data integrity and manually delete the WAL file.
+        let version_str = if &magic == MAGIC_V1 { "v1" } else { "v2" };
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "WAL v1 detected at {:?}. V1 format cannot be replayed (no record metadata). \
+                "WAL {} detected at {:?}. This format cannot be replayed. \
                  Please verify records.jsonl is complete, then delete the WAL file to proceed.",
-                path
+                version_str, path
             ),
         ));
-    } else if &magic != MAGIC_V2 {
+    } else if &magic != MAGIC_V3 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("invalid wal magic: expected {:?}, got {:?}", MAGIC_V2, magic),
+            format!("invalid wal magic: expected {:?}, got {:?}", MAGIC_V3, magic),
         ));
     }
 
@@ -253,25 +287,41 @@ pub fn replay<P: AsRef<Path>>(path: P) -> io::Result<Vec<WalOp>> {
                 let id = read_string(&mut reader)?;
                 let record = read_record(&mut reader, id.clone())?;
                 let embedding = read_embedding(&mut reader)?;
+                let deleted = read_bool(&mut reader)?;
                 ops.push(WalOp::Insert {
                     id,
                     record,
                     embedding,
+                    deleted,
                 });
             }
             OP_UPDATE => {
                 let id = read_string(&mut reader)?;
                 let record = read_record(&mut reader, id.clone())?;
                 let embedding = read_embedding(&mut reader)?;
+                let deleted = read_bool(&mut reader)?;
                 ops.push(WalOp::Update {
                     id,
                     record,
                     embedding,
+                    deleted,
                 });
             }
             OP_DELETE => {
                 let id = read_string(&mut reader)?;
                 ops.push(WalOp::Delete { id });
+            }
+            OP_APPEND => {
+                let id = read_string(&mut reader)?;
+                let record = read_record(&mut reader, id.clone())?;
+                let embedding = read_embedding(&mut reader)?;
+                let deleted = read_bool(&mut reader)?;
+                ops.push(WalOp::Append {
+                    id,
+                    record,
+                    embedding,
+                    deleted,
+                });
             }
             _ => {
                 return Err(io::Error::new(
@@ -285,10 +335,11 @@ pub fn replay<P: AsRef<Path>>(path: P) -> io::Result<Vec<WalOp>> {
     Ok(ops)
 }
 
-/// Apply WAL operations to records list using upsert semantics
-/// - INSERT: replaces existing record if ID exists, otherwise appends
-/// - UPDATE: replaces existing record if ID exists, otherwise appends (upsert)
-/// - DELETE: removes record if ID exists, no-op otherwise
+/// Apply WAL operations to records list (idempotent replay)
+/// - INSERT: upsert (replaces if ID exists, otherwise appends)
+/// - UPDATE: upsert (replaces if ID exists, otherwise appends)
+/// - DELETE: tombstones first occurrence if not already tombstoned (idempotent)
+/// - APPEND: appends only if no active record with same ID exists (idempotent)
 /// Returns true if any changes were made
 pub fn apply_ops_to_records(ops: Vec<WalOp>, records: &mut Vec<StoredRecord>) -> bool {
     if ops.is_empty() {
@@ -301,31 +352,52 @@ pub fn apply_ops_to_records(ops: Vec<WalOp>, records: &mut Vec<StoredRecord>) ->
                 id,
                 record,
                 embedding,
+                deleted,
             } => {
                 // Upsert: replace if exists, insert if not
+                let stored = StoredRecord::with_deleted(record, embedding, deleted);
                 if let Some(pos) = records.iter().position(|r| r.record.id == id) {
-                    records[pos] = StoredRecord { record, embedding };
+                    records[pos] = stored;
                 } else {
-                    records.push(StoredRecord { record, embedding });
+                    records.push(stored);
                 }
             }
             WalOp::Update {
                 id,
                 record,
                 embedding,
+                deleted,
             } => {
                 // Upsert: replace if exists, insert if not
+                let stored = StoredRecord::with_deleted(record, embedding, deleted);
                 if let Some(pos) = records.iter().position(|r| r.record.id == id) {
-                    records[pos] = StoredRecord { record, embedding };
+                    records[pos] = stored;
                 } else {
-                    records.push(StoredRecord { record, embedding });
+                    records.push(stored);
                 }
             }
             WalOp::Delete { id } => {
-                // Remove if exists, no-op otherwise
+                // Idempotent: only tombstone if first occurrence is not already deleted
                 if let Some(pos) = records.iter().position(|r| r.record.id == id) {
-                    records.remove(pos);
+                    if !records[pos].deleted {
+                        records[pos].deleted = true;
+                    }
+                    // If already deleted, skip (idempotent)
                 }
+            }
+            WalOp::Append {
+                id,
+                record,
+                embedding,
+                deleted,
+            } => {
+                // Idempotent: only append if no active record with same ID exists
+                let has_active = records.iter().any(|r| r.record.id == id && !r.deleted);
+                if !has_active {
+                    let stored = StoredRecord::with_deleted(record, embedding, deleted);
+                    records.push(stored);
+                }
+                // If active exists, skip (already applied)
             }
         }
     }
@@ -362,10 +434,11 @@ fn count_records<R: Read>(reader: &mut R) -> io::Result<usize> {
         }
 
         match op[0] {
-            OP_INSERT | OP_UPDATE => {
+            OP_INSERT | OP_UPDATE | OP_APPEND => {
                 let id = read_string(reader)?;
                 let _ = read_record(reader, id)?;
                 let _ = read_embedding(reader)?;
+                let _ = read_bool(reader)?; // deleted flag
                 count += 1;
             }
             OP_DELETE => {
@@ -480,6 +553,16 @@ fn read_embedding<R: Read>(reader: &mut R) -> io::Result<Vec<f32>> {
     Ok(embedding)
 }
 
+fn write_bool<W: Write>(writer: &mut W, value: bool) -> io::Result<()> {
+    writer.write_all(&[if value { 1 } else { 0 }])
+}
+
+fn read_bool<R: Read>(reader: &mut R) -> io::Result<bool> {
+    let mut buf = [0u8; 1];
+    reader.read_exact(&mut buf)?;
+    Ok(buf[0] != 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -511,10 +594,7 @@ mod tests {
             updated_at: None,
             tags: Some("tag1,tag2".to_string()),
         };
-        let stored = StoredRecord {
-            record,
-            embedding: vec![1.0, 0.0, 0.5],
-        };
+        let stored = StoredRecord::new(record, vec![1.0, 0.0, 0.5]);
 
         {
             let mut wal = WalWriter::new(&wal_path).unwrap();
@@ -530,12 +610,14 @@ mod tests {
                 id,
                 record,
                 embedding,
+                deleted,
             } => {
                 assert_eq!(id, "doc-1");
                 assert_eq!(record.title, Some("Title".to_string()));
                 assert_eq!(record.body, Some("Body text".to_string()));
                 assert_eq!(record.tags, Some("tag1,tag2".to_string()));
                 assert_eq!(embedding, &vec![1.0, 0.0, 0.5]);
+                assert!(!deleted);
             }
             _ => panic!("Expected Insert operation"),
         }
@@ -547,8 +629,8 @@ mod tests {
     fn test_wal_update_delete_replay() {
         let wal_path = temp_path("wal_update_delete");
 
-        let record1 = StoredRecord {
-            record: Record {
+        let record1 = StoredRecord::new(
+            Record {
                 id: "doc-1".to_string(),
                 title: Some("Original".to_string()),
                 body: None,
@@ -556,11 +638,11 @@ mod tests {
                 updated_at: None,
                 tags: None,
             },
-            embedding: vec![1.0, 0.0],
-        };
+            vec![1.0, 0.0],
+        );
 
-        let record2 = StoredRecord {
-            record: Record {
+        let record2 = StoredRecord::new(
+            Record {
                 id: "doc-1".to_string(),
                 title: Some("Updated".to_string()),
                 body: Some("New body".to_string()),
@@ -568,8 +650,8 @@ mod tests {
                 updated_at: None,
                 tags: None,
             },
-            embedding: vec![0.5, 0.5],
-        };
+            vec![0.5, 0.5],
+        );
 
         {
             let mut wal = WalWriter::new(&wal_path).unwrap();
@@ -605,6 +687,7 @@ mod tests {
                     tags: None,
                 },
                 embedding: vec![1.0, 0.0],
+                deleted: false,
             },
             WalOp::Insert {
                 id: "doc-2".to_string(),
@@ -617,6 +700,7 @@ mod tests {
                     tags: None,
                 },
                 embedding: vec![0.0, 1.0],
+                deleted: false,
             },
             WalOp::Update {
                 id: "doc-1".to_string(),
@@ -629,6 +713,7 @@ mod tests {
                     tags: None,
                 },
                 embedding: vec![0.5, 0.5],
+                deleted: false,
             },
             WalOp::Delete {
                 id: "doc-2".to_string(),
@@ -637,19 +722,25 @@ mod tests {
 
         let changed = apply_ops_to_records(ops, &mut records);
         assert!(changed);
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].record.id, "doc-1");
-        assert_eq!(records[0].record.title, Some("Updated Title1".to_string()));
-        assert_eq!(records[0].record.body, Some("New body".to_string()));
-        assert_eq!(records[0].embedding, vec![0.5, 0.5]);
+        // Tombstone semantics: Delete marks as deleted, doesn't remove
+        assert_eq!(records.len(), 2);
+
+        let doc1 = records.iter().find(|r| r.record.id == "doc-1").unwrap();
+        assert_eq!(doc1.record.title, Some("Updated Title1".to_string()));
+        assert_eq!(doc1.record.body, Some("New body".to_string()));
+        assert_eq!(doc1.embedding, vec![0.5, 0.5]);
+        assert!(!doc1.deleted);
+
+        let doc2 = records.iter().find(|r| r.record.id == "doc-2").unwrap();
+        assert!(doc2.deleted); // Tombstoned
     }
 
     #[test]
     fn test_wal_truncate() {
         let wal_path = temp_path("wal_truncate");
 
-        let record = StoredRecord {
-            record: Record {
+        let record = StoredRecord::new(
+            Record {
                 id: "doc-1".to_string(),
                 title: Some("Title".to_string()),
                 body: None,
@@ -657,8 +748,8 @@ mod tests {
                 updated_at: None,
                 tags: None,
             },
-            embedding: vec![1.0, 0.0],
-        };
+            vec![1.0, 0.0],
+        );
 
         {
             let mut wal = WalWriter::new(&wal_path).unwrap();
@@ -679,8 +770,8 @@ mod tests {
     fn test_wal_resume_append() {
         let wal_path = temp_path("wal_resume");
 
-        let record1 = StoredRecord {
-            record: Record {
+        let record1 = StoredRecord::new(
+            Record {
                 id: "doc-1".to_string(),
                 title: Some("Title1".to_string()),
                 body: None,
@@ -688,11 +779,11 @@ mod tests {
                 updated_at: None,
                 tags: None,
             },
-            embedding: vec![1.0, 0.0],
-        };
+            vec![1.0, 0.0],
+        );
 
-        let record2 = StoredRecord {
-            record: Record {
+        let record2 = StoredRecord::new(
+            Record {
                 id: "doc-2".to_string(),
                 title: Some("Title2".to_string()),
                 body: None,
@@ -700,8 +791,8 @@ mod tests {
                 updated_at: None,
                 tags: None,
             },
-            embedding: vec![0.0, 1.0],
-        };
+            vec![0.0, 1.0],
+        );
 
         // Write first record
         {
@@ -735,8 +826,8 @@ mod tests {
 
         // Initial state: 2 records already in the store
         let mut records = vec![
-            StoredRecord {
-                record: Record {
+            StoredRecord::new(
+                Record {
                     id: "existing-1".to_string(),
                     title: Some("Existing 1".to_string()),
                     body: None,
@@ -744,10 +835,10 @@ mod tests {
                     updated_at: None,
                     tags: None,
                 },
-                embedding: vec![1.0, 0.0],
-            },
-            StoredRecord {
-                record: Record {
+                vec![1.0, 0.0],
+            ),
+            StoredRecord::new(
+                Record {
                     id: "existing-2".to_string(),
                     title: Some("Existing 2".to_string()),
                     body: None,
@@ -755,8 +846,8 @@ mod tests {
                     updated_at: None,
                     tags: None,
                 },
-                embedding: vec![0.0, 1.0],
-            },
+                vec![0.0, 1.0],
+            ),
         ];
 
         // Simulate operations that happen before "crash"
@@ -764,8 +855,8 @@ mod tests {
             let mut wal = WalWriter::new(&wal_path).unwrap();
 
             // Insert a new record
-            let new_record = StoredRecord {
-                record: Record {
+            let new_record = StoredRecord::new(
+                Record {
                     id: "new-1".to_string(),
                     title: Some("New Record".to_string()),
                     body: Some("New body".to_string()),
@@ -773,13 +864,13 @@ mod tests {
                     updated_at: None,
                     tags: None,
                 },
-                embedding: vec![0.5, 0.5],
-            };
+                vec![0.5, 0.5],
+            );
             wal.append_insert(&new_record).unwrap();
 
             // Update an existing record
-            let updated_record = StoredRecord {
-                record: Record {
+            let updated_record = StoredRecord::new(
+                Record {
                     id: "existing-1".to_string(),
                     title: Some("Updated Existing 1".to_string()),
                     body: Some("Updated body".to_string()),
@@ -787,8 +878,8 @@ mod tests {
                     updated_at: None,
                     tags: None,
                 },
-                embedding: vec![0.8, 0.2],
-            };
+                vec![0.8, 0.2],
+            );
             wal.append_update(&updated_record).unwrap();
 
             // Delete a record
@@ -805,23 +896,26 @@ mod tests {
         let changed = apply_ops_to_records(ops, &mut records);
         assert!(changed);
 
-        // Verify final state
-        assert_eq!(records.len(), 2); // existing-1 + new-1 (existing-2 deleted)
+        // Verify final state (tombstone semantics: deleted records remain but marked)
+        assert_eq!(records.len(), 3); // existing-1 + existing-2 (tombstoned) + new-1
 
         // Find and verify the updated existing-1
         let existing1 = records.iter().find(|r| r.record.id == "existing-1").unwrap();
         assert_eq!(existing1.record.title, Some("Updated Existing 1".to_string()));
         assert_eq!(existing1.record.body, Some("Updated body".to_string()));
         assert_eq!(existing1.embedding, vec![0.8, 0.2]);
+        assert!(!existing1.deleted);
 
         // Find and verify the new record
         let new1 = records.iter().find(|r| r.record.id == "new-1").unwrap();
         assert_eq!(new1.record.title, Some("New Record".to_string()));
         assert_eq!(new1.record.body, Some("New body".to_string()));
         assert_eq!(new1.embedding, vec![0.5, 0.5]);
+        assert!(!new1.deleted);
 
-        // Verify existing-2 was deleted
-        assert!(records.iter().find(|r| r.record.id == "existing-2").is_none());
+        // Verify existing-2 was marked as deleted (tombstoned)
+        let existing2 = records.iter().find(|r| r.record.id == "existing-2").unwrap();
+        assert!(existing2.deleted);
 
         std::fs::remove_file(&wal_path).ok();
     }
@@ -830,8 +924,8 @@ mod tests {
     fn test_wal_should_rotate() {
         let wal_path = temp_path("wal_rotation");
 
-        let record = StoredRecord {
-            record: Record {
+        let record = StoredRecord::new(
+            Record {
                 id: "doc-1".to_string(),
                 title: Some("Title".to_string()),
                 body: None,
@@ -839,8 +933,8 @@ mod tests {
                 updated_at: None,
                 tags: None,
             },
-            embedding: vec![1.0, 0.0],
-        };
+            vec![1.0, 0.0],
+        );
 
         {
             let mut wal = WalWriter::new(&wal_path).unwrap();
@@ -905,8 +999,8 @@ mod tests {
     #[test]
     fn test_wal_empty_ops() {
         let ops: Vec<WalOp> = Vec::new();
-        let mut records = vec![StoredRecord {
-            record: Record {
+        let mut records = vec![StoredRecord::new(
+            Record {
                 id: "existing".to_string(),
                 title: Some("Existing".to_string()),
                 body: None,
@@ -914,8 +1008,8 @@ mod tests {
                 updated_at: None,
                 tags: None,
             },
-            embedding: vec![1.0, 0.0],
-        }];
+            vec![1.0, 0.0],
+        )];
 
         let changed = apply_ops_to_records(ops, &mut records);
         assert!(!changed);
@@ -955,10 +1049,37 @@ mod tests {
     }
 
     #[test]
+    fn test_wal_v2_detection() {
+        let wal_path = temp_path("wal_v2_detection");
+
+        // Write a v2 WAL file (no deleted flag)
+        {
+            let mut file = File::create(&wal_path).unwrap();
+            file.write_all(b"MUSUBIW2").unwrap(); // v2 magic
+            file.write_all(&2u32.to_le_bytes()).unwrap(); // version 2
+            file.flush().unwrap();
+        }
+
+        // replay should return an error for v2 WAL
+        let result = replay(&wal_path);
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        assert!(err.to_string().contains("WAL v2 detected"));
+
+        // WalWriter::new should also return an error for v2 WAL
+        let result = WalWriter::new(&wal_path);
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        assert!(err.to_string().contains("WAL v2 detected"));
+
+        std::fs::remove_file(&wal_path).ok();
+    }
+
+    #[test]
     fn test_apply_ops_upsert_semantics() {
         // Test that INSERT uses upsert (replaces if exists)
-        let mut records = vec![StoredRecord {
-            record: Record {
+        let mut records = vec![StoredRecord::new(
+            Record {
                 id: "doc-1".to_string(),
                 title: Some("Original".to_string()),
                 body: None,
@@ -966,48 +1087,151 @@ mod tests {
                 updated_at: None,
                 tags: None,
             },
-            embedding: vec![1.0, 0.0],
+            vec![1.0, 0.0],
+        )];
+
+        let ops = vec![WalOp::Insert {
+            id: "doc-1".to_string(),
+            record: Record {
+                id: "doc-1".to_string(),
+                title: Some("Replaced via INSERT".to_string()),
+                body: None,
+                source: None,
+                updated_at: None,
+                tags: None,
+            },
+            embedding: vec![0.5, 0.5],
+            deleted: false,
         }];
 
+        apply_ops_to_records(ops, &mut records);
+        assert_eq!(records.len(), 1); // INSERT upserts (replaces)
+        assert_eq!(
+            records[0].record.title,
+            Some("Replaced via INSERT".to_string())
+        );
+
+        // Test that UPDATE uses upsert (inserts if not exists)
+        let ops = vec![WalOp::Update {
+            id: "doc-new".to_string(),
+            record: Record {
+                id: "doc-new".to_string(),
+                title: Some("Inserted via UPDATE".to_string()),
+                body: None,
+                source: None,
+                updated_at: None,
+                tags: None,
+            },
+            embedding: vec![0.8, 0.2],
+            deleted: false,
+        }];
+
+        apply_ops_to_records(ops, &mut records);
+        assert_eq!(records.len(), 2); // UPDATE inserts new record
+        let new_record = records.iter().find(|r| r.record.id == "doc-new").unwrap();
+        assert_eq!(
+            new_record.record.title,
+            Some("Inserted via UPDATE".to_string())
+        );
+    }
+
+    #[test]
+    fn test_tombstone_append_via_delete_append() {
+        // Test the tombstone-append pattern: DELETE(old) + APPEND(new)
+        let mut records = vec![StoredRecord::new(
+            Record {
+                id: "doc-1".to_string(),
+                title: Some("Original".to_string()),
+                body: None,
+                source: None,
+                updated_at: None,
+                tags: None,
+            },
+            vec![1.0, 0.0],
+        )];
+
+        // Simulate embedding-change update: DELETE then APPEND
         let ops = vec![
-            WalOp::Insert {
+            WalOp::Delete {
+                id: "doc-1".to_string(),
+            },
+            WalOp::Append {
                 id: "doc-1".to_string(),
                 record: Record {
                     id: "doc-1".to_string(),
-                    title: Some("Replaced via INSERT".to_string()),
+                    title: Some("New version".to_string()),
                     body: None,
                     source: None,
                     updated_at: None,
                     tags: None,
                 },
                 embedding: vec![0.5, 0.5],
+                deleted: false,
             },
         ];
 
         apply_ops_to_records(ops, &mut records);
-        assert_eq!(records.len(), 1); // Still 1 record, not duplicated
-        assert_eq!(records[0].record.title, Some("Replaced via INSERT".to_string()));
-        assert_eq!(records[0].embedding, vec![0.5, 0.5]);
+        assert_eq!(records.len(), 2); // Old (tombstoned) + new
+        assert!(records[0].deleted); // Old is tombstoned
+        assert_eq!(records[0].record.title, Some("Original".to_string()));
+        assert!(!records[1].deleted); // New is active
+        assert_eq!(records[1].record.title, Some("New version".to_string()));
+    }
 
-        // Test that UPDATE uses upsert (inserts if not exists)
-        let ops = vec![
-            WalOp::Update {
-                id: "doc-new".to_string(),
-                record: Record {
-                    id: "doc-new".to_string(),
-                    title: Some("Inserted via UPDATE".to_string()),
+    #[test]
+    fn test_idempotent_replay_after_save() {
+        // Test that replay is idempotent when crash happens after save
+        // Scenario: DELETE + APPEND already applied to records.jsonl
+        let mut records = vec![
+            StoredRecord::with_deleted(
+                Record {
+                    id: "doc-1".to_string(),
+                    title: Some("Original".to_string()),
                     body: None,
                     source: None,
                     updated_at: None,
                     tags: None,
                 },
-                embedding: vec![0.0, 1.0],
+                vec![1.0, 0.0],
+                true, // Already tombstoned
+            ),
+            StoredRecord::new(
+                Record {
+                    id: "doc-1".to_string(),
+                    title: Some("New version".to_string()),
+                    body: None,
+                    source: None,
+                    updated_at: None,
+                    tags: None,
+                },
+                vec![0.5, 0.5],
+            ),
+        ];
+
+        // Replay the same ops (simulating crash after save but before WAL truncate)
+        let ops = vec![
+            WalOp::Delete {
+                id: "doc-1".to_string(),
+            },
+            WalOp::Append {
+                id: "doc-1".to_string(),
+                record: Record {
+                    id: "doc-1".to_string(),
+                    title: Some("New version".to_string()),
+                    body: None,
+                    source: None,
+                    updated_at: None,
+                    tags: None,
+                },
+                embedding: vec![0.5, 0.5],
+                deleted: false,
             },
         ];
 
         apply_ops_to_records(ops, &mut records);
-        assert_eq!(records.len(), 2); // Now 2 records
-        let new_record = records.iter().find(|r| r.record.id == "doc-new").unwrap();
-        assert_eq!(new_record.record.title, Some("Inserted via UPDATE".to_string()));
+        // Should remain unchanged (idempotent)
+        assert_eq!(records.len(), 2);
+        assert!(records[0].deleted); // Still tombstoned
+        assert!(!records[1].deleted); // Still active
     }
 }
