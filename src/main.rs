@@ -5,6 +5,7 @@ use musubi::infrastructure::embedding::http::HttpEmbedder;
 use musubi::infrastructure::embedding::python::PythonEmbedder;
 use musubi::infrastructure::index::adapter::HnswIndexFactory;
 use musubi::infrastructure::storage::record_store::JsonlRecordStore;
+use musubi::infrastructure::storage::wal::WalConfig;
 use musubi::interface::http::server::serve;
 use std::io;
 use std::path::PathBuf;
@@ -15,10 +16,49 @@ async fn main() -> io::Result<()> {
     let records_path = PathBuf::from("data/records.jsonl");
     let addr = std::env::var("MUSUBI_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".to_string());
 
+    // WAL configuration
+    let wal_config = {
+        let wal_path = std::env::var("MUSUBI_WAL_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("hnsw.wal"));
+
+        let max_bytes = std::env::var("MUSUBI_WAL_MAX_BYTES")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok());
+
+        let max_records = std::env::var("MUSUBI_WAL_MAX_RECORDS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok());
+
+        // WAL is enabled by default
+        let wal_enabled = std::env::var("MUSUBI_WAL_ENABLED")
+            .map(|s| s != "0" && s.to_lowercase() != "false")
+            .unwrap_or(true);
+
+        if wal_enabled {
+            println!("WAL enabled: {:?}", wal_path);
+            if let Some(max_bytes) = max_bytes {
+                println!("  max_bytes: {}", max_bytes);
+            }
+            if let Some(max_records) = max_records {
+                println!("  max_records: {}", max_records);
+            }
+            Some(WalConfig {
+                path: wal_path,
+                max_bytes,
+                max_records,
+            })
+        } else {
+            println!("WAL disabled");
+            None
+        }
+    };
+
     let config = ServiceConfig {
         snapshot_path,
         default_k: 5,
         default_ef: 100,
+        wal_config,
     };
 
     let embedder: Box<dyn Embedder> = if let Ok(url) = std::env::var("MUSUBI_EMBED_URL") {

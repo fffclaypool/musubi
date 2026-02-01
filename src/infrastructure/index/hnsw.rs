@@ -2,7 +2,6 @@ use crate::domain::types::{SearchResult, Vector};
 use crate::infrastructure::index::metrics::{cosine_distance, normalize};
 use crate::infrastructure::index::neighbor::select_neighbors_heuristic;
 use crate::infrastructure::storage::file as storage_file;
-use crate::infrastructure::storage::wal::WalWriter;
 use ordered_float::OrderedFloat;
 use rand::Rng;
 use std::collections::{BinaryHeap, HashSet};
@@ -322,16 +321,6 @@ impl HnswIndex {
     /// インデックスをファイルに保存する
     pub fn save<P: AsRef<std::path::Path>>(&self, path: P) -> io::Result<()> {
         storage_file::save(self, path)
-    }
-
-    /// WALへ書き込み後にベクトルを挿入する
-    pub fn insert_with_wal(
-        &mut self,
-        vector: Vector,
-        wal: &mut WalWriter,
-    ) -> io::Result<usize> {
-        wal.append_insert(&vector)?;
-        Ok(self.insert(vector))
     }
 
     /// ファイルからインデックスを読み込む

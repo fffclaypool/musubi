@@ -1,6 +1,7 @@
 use crate::application::error::AppError;
 use crate::domain::model::{Record, StoredRecord};
 use crate::domain::ports::{Embedder, RecordStore, VectorIndex, VectorIndexFactory};
+use crate::infrastructure::storage::wal::{self, WalConfig, WalWriter};
 use serde::Serialize;
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -9,6 +10,7 @@ pub struct ServiceConfig {
     pub snapshot_path: PathBuf,
     pub default_k: usize,
     pub default_ef: usize,
+    pub wal_config: Option<WalConfig>,
 }
 
 pub struct DocumentService {
@@ -20,6 +22,8 @@ pub struct DocumentService {
     snapshot_path: PathBuf,
     default_k: usize,
     default_ef: usize,
+    wal: Option<WalWriter>,
+    wal_config: Option<WalConfig>,
 }
 
 #[derive(Debug, Clone)]
@@ -85,8 +89,34 @@ impl DocumentService {
         record_store: Box<dyn RecordStore>,
         index_factory: Box<dyn VectorIndexFactory>,
     ) -> Result<Self, AppError> {
+        // Load records from record store
         let mut records = record_store.load()?;
-        let index = index_factory.load_or_create(&config.snapshot_path, &records)?;
+
+        // Replay WAL if configured
+        let (wal, wal_had_ops) = if let Some(ref wal_config) = config.wal_config {
+            let ops = wal::replay(&wal_config.path)?;
+            let had_ops = !ops.is_empty();
+            if had_ops {
+                wal::apply_ops_to_records(ops, &mut records);
+                // Save merged records to record store
+                record_store.save_all(&records)?;
+            }
+            (Some(WalWriter::new(&wal_config.path)?), had_ops)
+        } else {
+            (None, false)
+        };
+
+        // Load or rebuild index from records
+        let index = if wal_had_ops {
+            // WAL had operations: always rebuild index from updated records
+            index_factory.rebuild(&records)
+        } else if config.snapshot_path.exists() {
+            // No WAL ops: load snapshot
+            index_factory.load_or_create(&config.snapshot_path, &records)?
+        } else {
+            // No snapshot: build from records
+            index_factory.rebuild(&records)
+        };
 
         let updated = fill_missing_embeddings(&mut records, index.as_ref());
         if updated {
@@ -101,7 +131,8 @@ impl DocumentService {
             )));
         }
 
-        Ok(Self {
+        // After successful load, save snapshot and truncate WAL
+        let mut service = Self {
             index,
             index_factory,
             records,
@@ -110,7 +141,20 @@ impl DocumentService {
             snapshot_path: config.snapshot_path,
             default_k: config.default_k,
             default_ef: config.default_ef,
-        })
+            wal,
+            wal_config: config.wal_config,
+        };
+
+        // Only truncate WAL if we successfully replayed v2 operations
+        // (v1 WAL can't be replayed, so wal_had_ops would be false)
+        if wal_had_ops {
+            service.index.save(&service.snapshot_path)?;
+            if let Some(ref mut wal) = service.wal {
+                wal.truncate()?;
+            }
+        }
+
+        Ok(service)
     }
 
     pub fn insert(&mut self, cmd: InsertCommand) -> Result<InsertResult, AppError> {
@@ -129,14 +173,24 @@ impl DocumentService {
             .ok_or_else(|| AppError::BadRequest("text/title/body is required".to_string()))?;
         let embedding = self.embed_single(text)?;
 
-        let index_id = self.index.insert(embedding.clone());
         let stored = StoredRecord {
             record: cmd.record.clone(),
             embedding: embedding.clone(),
         };
+
+        // Write to WAL first
+        if let Some(ref mut wal) = self.wal {
+            wal.append_insert(&stored)?;
+        }
+
+        // Then update index and records
+        let index_id = self.index.insert(embedding.clone());
         self.records.push(stored.clone());
         self.index.save(&self.snapshot_path)?;
         self.record_store.append(&stored)?;
+
+        // Check if WAL rotation is needed
+        self.maybe_rotate_wal()?;
 
         Ok(InsertResult {
             index_id,
@@ -175,11 +229,22 @@ impl DocumentService {
             current.embedding.clone()
         };
 
-        self.records[index_id] = StoredRecord {
+        let stored = StoredRecord {
             record: updated.clone(),
             embedding,
         };
+
+        // Write to WAL first
+        if let Some(ref mut wal) = self.wal {
+            wal.append_update(&stored)?;
+        }
+
+        // Update records and rebuild index
+        self.records[index_id] = stored;
         self.rebuild_index()?;
+
+        // Check if WAL rotation is needed
+        self.maybe_rotate_wal()?;
 
         Ok(DocumentResponse {
             index_id,
@@ -190,8 +255,19 @@ impl DocumentService {
 
     pub fn delete(&mut self, id: &str) -> Result<(), AppError> {
         let index_id = self.find_index(id)?;
+
+        // Write to WAL first
+        if let Some(ref mut wal) = self.wal {
+            wal.append_delete(id)?;
+        }
+
+        // Remove from records and rebuild index
         self.records.remove(index_id);
         self.rebuild_index()?;
+
+        // Check if WAL rotation is needed
+        self.maybe_rotate_wal()?;
+
         Ok(())
     }
 
@@ -284,8 +360,18 @@ impl DocumentService {
             }
         }
 
+        // Write to WAL first
+        if let Some(ref mut wal) = self.wal {
+            for record in &records {
+                wal.append_insert(record)?;
+            }
+        }
+
         self.records.extend(records);
         self.rebuild_index()?;
+
+        // Check if WAL rotation is needed
+        self.maybe_rotate_wal()?;
 
         Ok(self.records.len())
     }
@@ -301,6 +387,18 @@ impl DocumentService {
         self.index = self.index_factory.rebuild(&self.records);
         self.index.save(&self.snapshot_path)?;
         self.record_store.save_all(&self.records)?;
+        Ok(())
+    }
+
+    fn maybe_rotate_wal(&mut self) -> Result<(), AppError> {
+        if let (Some(ref mut wal), Some(ref config)) = (&mut self.wal, &self.wal_config) {
+            if wal.should_rotate(config)? {
+                // Save snapshot first, then truncate WAL
+                self.index.save(&self.snapshot_path)?;
+                self.record_store.save_all(&self.records)?;
+                wal.truncate()?;
+            }
+        }
         Ok(())
     }
 

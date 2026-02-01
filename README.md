@@ -8,6 +8,7 @@
 - コサイン距離 (正規化済み) のHNSW
 - 近傍選択の多様性ヒューリスティック
 - 単一ファイルへのスナップショット保存/復元
+- **WAL (Write-Ahead Log) による再起動耐性**
 - REST APIでの挿入/検索/取得/更新/削除
 - 埋め込みモデルの事前ロード対応
 
@@ -69,6 +70,15 @@ make help          - ヘルプを表示
 | `MUSUBI_EMBED_URL` | embeddingサーバーのURL (設定時HTTP embedder使用) | (未設定) |
 | `MUSUBI_PYTHON` | Pythonバイナリパス (Python embedder用) | `python3` |
 | `MUSUBI_MODEL` | embeddingモデル名 (Python embedder用) | `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` |
+
+### WAL (Write-Ahead Log)
+
+| 変数 | 説明 | デフォルト |
+|------|------|-----------|
+| `MUSUBI_WAL_ENABLED` | WALを有効化 (`0`または`false`で無効化) | `true` |
+| `MUSUBI_WAL_PATH` | WALファイルのパス | `hnsw.wal` |
+| `MUSUBI_WAL_MAX_BYTES` | WALローテーションの閾値 (バイト数) | (無制限) |
+| `MUSUBI_WAL_MAX_RECORDS` | WALローテーションの閾値 (レコード数) | (無制限) |
 
 ### Embeddingサーバー
 
@@ -205,6 +215,54 @@ python/
 
 - HNSWスナップショット: `hnsw.bin`
 - レコード/埋め込み: `data/records.jsonl`
+- WAL (Write-Ahead Log): `hnsw.wal`
+
+## WAL (Write-Ahead Log)
+
+WALにより、クラッシュや予期しない再起動からのデータ復旧が可能になります。
+
+### 仕組み
+
+1. **書き込み時**: 各操作 (INSERT/UPDATE/DELETE) は先にWALに記録され、その後でインデックスとレコードストアが更新されます
+2. **起動時**: スナップショットをロードし、WALをリプレイして最新状態に復元します
+3. **ローテーション**: WALサイズまたはレコード数が閾値を超えると、スナップショットを保存してWALをクリアします
+
+### 運用フロー
+
+```
+[起動]
+  └── records.jsonl をロード
+  └── hnsw.wal をリプレイ (存在する場合)
+  └── records.jsonl を更新 (WALの内容をマージ)
+  └── hnsw.bin を保存
+  └── hnsw.wal をクリア
+
+[操作 (INSERT/UPDATE/DELETE)]
+  └── WAL に追記
+  └── インデックス/レコード更新
+  └── hnsw.bin を保存
+  └── (閾値超過時) WAL ローテーション
+
+[クラッシュ時]
+  └── WAL に操作が残っている
+  └── 次回起動時にリプレイで復元
+```
+
+### 設定例
+
+```bash
+# WALを有効化し、10MBまたは1000件でローテーション
+MUSUBI_WAL_PATH=data/hnsw.wal \
+MUSUBI_WAL_MAX_BYTES=10485760 \
+MUSUBI_WAL_MAX_RECORDS=1000 \
+cargo run --release
+```
+
+### WALを無効化する場合
+
+```bash
+MUSUBI_WAL_ENABLED=false cargo run --release
+```
 
 ## 注意点
 
