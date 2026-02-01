@@ -1,4 +1,4 @@
-.PHONY: all build install run run-embed run-api dev clean test help
+.PHONY: all build install run run-embed run-api dev clean test bench bench-download help
 
 # Default target
 all: build
@@ -39,6 +39,24 @@ test:
 clean:
 	cargo clean
 
+# Download benchmark data
+bench-download:
+	./scripts/download_ann_data.sh
+
+# Run benchmark (10k subset)
+bench:
+	cargo run --release --bin bench_ann -- \
+		--dataset data/ann/glove-100-angular.hdf5 \
+		--train-limit 10000 \
+		--test-limit 1000 \
+		--save-index
+
+# Run benchmark (full dataset)
+bench-full:
+	cargo run --release --bin bench_ann -- \
+		--dataset data/ann/glove-100-angular.hdf5 \
+		--save-index
+
 # Show help
 help:
 	@echo "Available targets:"
@@ -49,9 +67,16 @@ help:
 	@echo "  run-api-python- Start API server with Python embedder (slower)"
 	@echo "  dev           - Show instructions for development setup"
 	@echo "  test          - Run tests"
+	@echo "  bench-download- Download ANN-Benchmarks data"
+	@echo "  bench         - Run benchmark (10k subset)"
+	@echo "  bench-full    - Run benchmark (full dataset)"
 	@echo "  clean         - Clean build artifacts"
 	@echo ""
 	@echo "Quick start:"
 	@echo "  1. make install"
 	@echo "  2. make run-embed  (terminal 1)"
 	@echo "  3. make run-api    (terminal 2)"
+	@echo ""
+	@echo "Benchmark:"
+	@echo "  1. make bench-download"
+	@echo "  2. make bench"
