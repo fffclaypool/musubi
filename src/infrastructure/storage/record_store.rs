@@ -33,10 +33,7 @@ impl RecordStore for JsonlRecordStore {
                 Err(_) => {
                     let record: Record =
                         serde_json::from_str(trimmed).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-                    records.push(StoredRecord {
-                        record,
-                        embedding: Vec::new(),
-                    });
+                    records.push(StoredRecord::new(record, Vec::new()));
                 }
             }
         }
