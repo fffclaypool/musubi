@@ -3,7 +3,7 @@ use crate::domain::model::{Record, StoredRecord};
 use crate::domain::ports::{Embedder, RecordStore, VectorIndex, VectorIndexFactory};
 use crate::infrastructure::search::Bm25Index;
 use crate::infrastructure::storage::wal::{self, WalConfig, WalWriter};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
@@ -65,6 +65,88 @@ pub struct UpdateCommand {
     pub text: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SearchFilter {
+    /// Exact match on source field
+    pub source: Option<String>,
+    /// Match if any of these tags are present (comma-separated tags)
+    pub tags_any: Option<Vec<String>>,
+    /// Match only if all of these tags are present (comma-separated tags)
+    pub tags_all: Option<Vec<String>>,
+    /// Match if updated_at >= this value (string comparison, YYYY-MM-DD)
+    pub updated_at_gte: Option<String>,
+    /// Match if updated_at <= this value (string comparison, YYYY-MM-DD)
+    pub updated_at_lte: Option<String>,
+}
+
+impl SearchFilter {
+    /// Check if a record matches all filter criteria
+    pub fn matches(&self, record: &Record) -> bool {
+        // source: exact match
+        if let Some(ref filter_source) = self.source {
+            match &record.source {
+                Some(record_source) if record_source == filter_source => {}
+                _ => return false,
+            }
+        }
+
+        // tags_any: at least one tag matches
+        if let Some(ref filter_tags) = self.tags_any {
+            if !filter_tags.is_empty() {
+                let record_tags = parse_tags(record.tags.as_deref());
+                let has_any = filter_tags
+                    .iter()
+                    .any(|t| record_tags.contains(&t.trim().to_lowercase()));
+                if !has_any {
+                    return false;
+                }
+            }
+        }
+
+        // tags_all: all tags must be present
+        if let Some(ref filter_tags) = self.tags_all {
+            if !filter_tags.is_empty() {
+                let record_tags = parse_tags(record.tags.as_deref());
+                let has_all = filter_tags
+                    .iter()
+                    .all(|t| record_tags.contains(&t.trim().to_lowercase()));
+                if !has_all {
+                    return false;
+                }
+            }
+        }
+
+        // updated_at_gte: string comparison
+        if let Some(ref gte) = self.updated_at_gte {
+            match &record.updated_at {
+                Some(updated_at) if updated_at.as_str() >= gte.as_str() => {}
+                _ => return false,
+            }
+        }
+
+        // updated_at_lte: string comparison
+        if let Some(ref lte) = self.updated_at_lte {
+            match &record.updated_at {
+                Some(updated_at) if updated_at.as_str() <= lte.as_str() => {}
+                _ => return false,
+            }
+        }
+
+        true
+    }
+}
+
+/// Parse comma-separated tags into a set of lowercase trimmed strings
+fn parse_tags(tags: Option<&str>) -> HashSet<String> {
+    tags.map(|t| {
+        t.split(',')
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
 #[derive(Debug, Clone)]
 pub struct SearchCommand {
     pub text: Option<String>,
@@ -74,6 +156,8 @@ pub struct SearchCommand {
     /// Weight for vector score in hybrid search (0.0 = BM25 only, 1.0 = vector only)
     /// Default is 0.7
     pub alpha: Option<f64>,
+    /// Optional filter to narrow down search results
+    pub filter: Option<SearchFilter>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -378,37 +462,51 @@ impl DocumentService {
 
         let query_text = cmd.text.clone();
 
-        // alpha=0.0 (BM25-only) requires text for BM25 search
+        // Validate parameters based on alpha
+        // alpha=0.0 (BM25-only): requires text, no embedding needed
+        // alpha=1.0 (vector-only): requires text or embedding
+        // 0 < alpha < 1 (hybrid): requires text or embedding
         if alpha == 0.0 && query_text.is_none() {
             return Err(AppError::BadRequest(
                 "alpha=0.0 (BM25-only) requires 'text' parameter".to_string(),
             ));
         }
-
-        let embedding = if let Some(embedding) = cmd.embedding {
-            embedding
-        } else if let Some(ref text) = query_text {
-            self.embed_single(text.clone())?
-        } else {
+        if alpha > 0.0 && query_text.is_none() && cmd.embedding.is_none() {
             return Err(AppError::BadRequest("text or embedding is required".to_string()));
-        };
-
-        // Get vector search results (request more to account for tombstones and hybrid merging)
-        let search_k = (k * 4).max(100);
-        let search_ef = ef.max(search_k);
-        let vector_results = self.index.search(&embedding, search_k, search_ef);
-
-        // Collect vector scores (filter tombstones)
-        let mut vector_scores: HashMap<usize, f32> = HashMap::new();
-        for result in vector_results {
-            if let Some(record) = self.records.get(result.id) {
-                if !record.deleted {
-                    vector_scores.insert(result.id, result.distance);
-                }
-            }
         }
 
-        // Get BM25 results if we have a text query
+        let search_k = (k * 4).max(100);
+        let search_ef = ef.max(search_k);
+
+        // Get vector search results (skip if alpha=0.0, BM25-only)
+        let vector_scores: HashMap<usize, f32> = if alpha == 0.0 {
+            HashMap::new()
+        } else {
+            let embedding = if let Some(embedding) = cmd.embedding.clone() {
+                embedding
+            } else if let Some(ref text) = query_text {
+                self.embed_single(text.clone())?
+            } else {
+                // This shouldn't happen due to validation above
+                return Err(AppError::BadRequest("text or embedding is required".to_string()));
+            };
+
+            let vector_results = self.index.search(&embedding, search_k, search_ef);
+            vector_results
+                .into_iter()
+                .filter_map(|result| {
+                    self.records.get(result.id).and_then(|record| {
+                        if record.deleted {
+                            None
+                        } else {
+                            Some((result.id, result.distance))
+                        }
+                    })
+                })
+                .collect()
+        };
+
+        // Get BM25 results (skip if alpha=1.0 and no text, or if no text provided)
         let bm25_scores: HashMap<usize, f64> = if let Some(ref text) = query_text {
             self.bm25_index
                 .search(text, search_k)
@@ -450,6 +548,13 @@ impl DocumentService {
                 let record = self.records.get(index_id)?;
                 if record.deleted {
                     return None;
+                }
+
+                // Apply metadata filter if present
+                if let Some(ref filter) = cmd.filter {
+                    if !filter.matches(&record.record) {
+                        return None;
+                    }
                 }
 
                 let distance = vector_scores.get(&index_id).copied();
@@ -724,4 +829,223 @@ fn fill_missing_embeddings(records: &mut [StoredRecord], index: &dyn VectorIndex
         }
     }
     filled
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_record(
+        id: &str,
+        source: Option<&str>,
+        tags: Option<&str>,
+        updated_at: Option<&str>,
+    ) -> Record {
+        Record {
+            id: id.to_string(),
+            title: Some("Test".to_string()),
+            body: None,
+            source: source.map(|s| s.to_string()),
+            updated_at: updated_at.map(|s| s.to_string()),
+            tags: tags.map(|s| s.to_string()),
+        }
+    }
+
+    #[test]
+    fn test_filter_empty_matches_all() {
+        let filter = SearchFilter::default();
+        let record = make_record("1", Some("news"), Some("ai, rust"), Some("2024-06-15"));
+        assert!(filter.matches(&record));
+    }
+
+    #[test]
+    fn test_filter_source_exact_match() {
+        let filter = SearchFilter {
+            source: Some("news".to_string()),
+            ..Default::default()
+        };
+        let record = make_record("1", Some("news"), None, None);
+        assert!(filter.matches(&record));
+
+        let record2 = make_record("2", Some("blog"), None, None);
+        assert!(!filter.matches(&record2));
+
+        let record3 = make_record("3", None, None, None);
+        assert!(!filter.matches(&record3));
+    }
+
+    #[test]
+    fn test_filter_tags_any() {
+        let filter = SearchFilter {
+            tags_any: Some(vec!["ai".to_string(), "ml".to_string()]),
+            ..Default::default()
+        };
+
+        // Has "ai" tag
+        let record1 = make_record("1", None, Some("ai, rust"), None);
+        assert!(filter.matches(&record1));
+
+        // Has "ml" tag
+        let record2 = make_record("2", None, Some("ml, python"), None);
+        assert!(filter.matches(&record2));
+
+        // Has neither
+        let record3 = make_record("3", None, Some("rust, go"), None);
+        assert!(!filter.matches(&record3));
+
+        // No tags at all
+        let record4 = make_record("4", None, None, None);
+        assert!(!filter.matches(&record4));
+    }
+
+    #[test]
+    fn test_filter_tags_all() {
+        let filter = SearchFilter {
+            tags_all: Some(vec!["ai".to_string(), "rust".to_string()]),
+            ..Default::default()
+        };
+
+        // Has both tags
+        let record1 = make_record("1", None, Some("ai, rust, news"), None);
+        assert!(filter.matches(&record1));
+
+        // Has only one
+        let record2 = make_record("2", None, Some("ai, python"), None);
+        assert!(!filter.matches(&record2));
+
+        // Has neither
+        let record3 = make_record("3", None, Some("go, python"), None);
+        assert!(!filter.matches(&record3));
+    }
+
+    #[test]
+    fn test_filter_tags_case_insensitive() {
+        let filter = SearchFilter {
+            tags_any: Some(vec!["AI".to_string(), "RUST".to_string()]),
+            ..Default::default()
+        };
+
+        let record = make_record("1", None, Some("ai, rust"), None);
+        assert!(filter.matches(&record));
+
+        let filter2 = SearchFilter {
+            tags_all: Some(vec!["AI".to_string()]),
+            ..Default::default()
+        };
+        assert!(filter2.matches(&record));
+    }
+
+    #[test]
+    fn test_filter_tags_with_whitespace() {
+        let filter = SearchFilter {
+            tags_any: Some(vec!["ai".to_string()]),
+            ..Default::default()
+        };
+
+        // Tags with extra whitespace
+        let record = make_record("1", None, Some("  ai  ,  rust  "), None);
+        assert!(filter.matches(&record));
+    }
+
+    #[test]
+    fn test_filter_updated_at_gte() {
+        let filter = SearchFilter {
+            updated_at_gte: Some("2024-06-01".to_string()),
+            ..Default::default()
+        };
+
+        let record1 = make_record("1", None, None, Some("2024-06-15"));
+        assert!(filter.matches(&record1));
+
+        let record2 = make_record("2", None, None, Some("2024-06-01"));
+        assert!(filter.matches(&record2));
+
+        let record3 = make_record("3", None, None, Some("2024-05-31"));
+        assert!(!filter.matches(&record3));
+
+        // No updated_at
+        let record4 = make_record("4", None, None, None);
+        assert!(!filter.matches(&record4));
+    }
+
+    #[test]
+    fn test_filter_updated_at_lte() {
+        let filter = SearchFilter {
+            updated_at_lte: Some("2024-06-30".to_string()),
+            ..Default::default()
+        };
+
+        let record1 = make_record("1", None, None, Some("2024-06-15"));
+        assert!(filter.matches(&record1));
+
+        let record2 = make_record("2", None, None, Some("2024-06-30"));
+        assert!(filter.matches(&record2));
+
+        let record3 = make_record("3", None, None, Some("2024-07-01"));
+        assert!(!filter.matches(&record3));
+    }
+
+    #[test]
+    fn test_filter_updated_at_range() {
+        let filter = SearchFilter {
+            updated_at_gte: Some("2024-01-01".to_string()),
+            updated_at_lte: Some("2024-12-31".to_string()),
+            ..Default::default()
+        };
+
+        let record1 = make_record("1", None, None, Some("2024-06-15"));
+        assert!(filter.matches(&record1));
+
+        let record2 = make_record("2", None, None, Some("2023-12-31"));
+        assert!(!filter.matches(&record2));
+
+        let record3 = make_record("3", None, None, Some("2025-01-01"));
+        assert!(!filter.matches(&record3));
+    }
+
+    #[test]
+    fn test_filter_combined() {
+        let filter = SearchFilter {
+            source: Some("news".to_string()),
+            tags_any: Some(vec!["ai".to_string(), "rust".to_string()]),
+            updated_at_gte: Some("2024-01-01".to_string()),
+            ..Default::default()
+        };
+
+        // All conditions match
+        let record1 = make_record("1", Some("news"), Some("ai, tech"), Some("2024-06-15"));
+        assert!(filter.matches(&record1));
+
+        // Wrong source
+        let record2 = make_record("2", Some("blog"), Some("ai, tech"), Some("2024-06-15"));
+        assert!(!filter.matches(&record2));
+
+        // No matching tags
+        let record3 = make_record("3", Some("news"), Some("go, python"), Some("2024-06-15"));
+        assert!(!filter.matches(&record3));
+
+        // Too old
+        let record4 = make_record("4", Some("news"), Some("ai, tech"), Some("2023-12-31"));
+        assert!(!filter.matches(&record4));
+    }
+
+    #[test]
+    fn test_parse_tags() {
+        let tags = parse_tags(Some("ai, rust, ML"));
+        assert!(tags.contains("ai"));
+        assert!(tags.contains("rust"));
+        assert!(tags.contains("ml"));
+        assert_eq!(tags.len(), 3);
+
+        let empty = parse_tags(None);
+        assert!(empty.is_empty());
+
+        let empty2 = parse_tags(Some(""));
+        assert!(empty2.is_empty());
+
+        let with_spaces = parse_tags(Some("  ai  ,  ,  rust  "));
+        assert!(with_spaces.contains("ai"));
+        assert!(with_spaces.contains("rust"));
+        assert_eq!(with_spaces.len(), 2);
+    }
 }

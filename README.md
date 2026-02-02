@@ -133,8 +133,24 @@ curl -s -X POST http://127.0.0.1:8080/documents \
 | `k` | int | 取得件数 | 5 |
 | `ef` | int | 検索の探索幅 | 100 |
 | `alpha` | float | ハイブリッドスコアの重み (0.0=BM25のみ, 1.0=ベクトルのみ) | 0.7 |
+| `filter` | object | メタデータフィルタ (後述) | - |
 
 **注意:** `alpha=0.0` (BM25のみ) を指定する場合は `text` パラメータが必須です。
+
+**フィルタパラメータ:**
+
+| フィールド | 型 | 説明 |
+|-----------|-----|------|
+| `source` | string | sourceフィールドの完全一致 |
+| `tags_any` | string[] | いずれかのタグが含まれる (OR条件) |
+| `tags_all` | string[] | すべてのタグが含まれる (AND条件) |
+| `updated_at_gte` | string | updated_at >= 指定値 (YYYY-MM-DD形式、文字列比較) |
+| `updated_at_lte` | string | updated_at <= 指定値 (YYYY-MM-DD形式、文字列比較) |
+
+**タグ照合の仕様:**
+- ドキュメントの `tags` フィールドはカンマ区切り (例: `"ai, rust, news"`)
+- 照合時は大文字小文字を区別しない (lowercase比較)
+- 前後の空白は自動でトリム
 
 **リクエスト例:**
 
@@ -153,6 +169,32 @@ curl -s -X POST http://127.0.0.1:8080/search \
 curl -s -X POST http://127.0.0.1:8080/search \
   -H 'content-type: application/json' \
   -d '{"text":"Hello world","k":5,"alpha":1.0}'
+
+# フィルタ付き検索 (source + tags + 日付範囲)
+curl -s -X POST http://127.0.0.1:8080/search \
+  -H 'content-type: application/json' \
+  -d '{
+    "text": "Hello world",
+    "k": 10,
+    "alpha": 0.7,
+    "filter": {
+      "source": "news",
+      "tags_any": ["ai", "rust"],
+      "updated_at_gte": "2024-01-01",
+      "updated_at_lte": "2024-12-31"
+    }
+  }'
+
+# 特定タグを全て含むドキュメントのみ検索
+curl -s -X POST http://127.0.0.1:8080/search \
+  -H 'content-type: application/json' \
+  -d '{
+    "text": "machine learning",
+    "k": 5,
+    "filter": {
+      "tags_all": ["ai", "tutorial"]
+    }
+  }'
 ```
 
 **レスポンス例:**

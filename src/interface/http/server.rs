@@ -1,7 +1,7 @@
 use crate::application::error::AppError;
 use crate::application::service::{
     DocumentResponse, DocumentService, DocumentSummary, InsertCommand, InsertResult, SearchCommand,
-    SearchHit, UpdateCommand,
+    SearchFilter, SearchHit, UpdateCommand,
 };
 use crate::domain::model::Record;
 use axum::{
@@ -55,6 +55,8 @@ struct SearchRequest {
     ef: Option<usize>,
     /// Weight for vector score in hybrid search (0.0 = BM25 only, 1.0 = vector only)
     alpha: Option<f64>,
+    /// Optional metadata filter
+    filter: Option<SearchFilter>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -202,6 +204,7 @@ async fn search_handler(
         k: req.k,
         ef: req.ef,
         alpha: req.alpha,
+        filter: req.filter,
     };
 
     let state = state.clone();
