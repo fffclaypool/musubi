@@ -81,6 +81,39 @@ make help          - ヘルプを表示
 | `MUSUBI_WAL_MAX_BYTES` | WALローテーションの閾値 (バイト数) | (無制限) |
 | `MUSUBI_WAL_MAX_RECORDS` | WALローテーションの閾値 (レコード数) | (無制限) |
 
+### Chunking (チャンク分割)
+
+長いドキュメントを小さなチャンクに分割し、チャンク単位でベクトル検索を行います。検索結果は親ドキュメント単位で集約されます。
+
+| 変数 | 説明 | デフォルト |
+|------|------|-----------|
+| `MUSUBI_CHUNK_TYPE` | チャンク方式 (`none`/`fixed`/`semantic`) | `none` |
+| `MUSUBI_CHUNK_SIZE` | Fixed: チャンクサイズ (文字数) | `512` |
+| `MUSUBI_CHUNK_OVERLAP` | Fixed: オーバーラップ (文字数) | `50` |
+| `MUSUBI_CHUNK_MIN_SIZE` | Semantic: 最小チャンクサイズ | `100` |
+| `MUSUBI_CHUNK_MAX_SIZE` | Semantic: 最大チャンクサイズ | `1000` |
+| `MUSUBI_CHUNK_THRESHOLD` | Semantic: 類似度閾値 (0.0-1.0) | `0.5` |
+
+**チャンク方式:**
+
+- `none` (デフォルト): チャンクなし。従来どおりドキュメント全体を1つのベクトルとしてインデックス
+- `fixed`: 固定長チャンク。単語境界で分割し、指定サイズ+オーバーラップで分割
+- `semantic`: セマンティックチャンク。文単位で分割し、隣接文の類似度が閾値を下回る箇所で分割
+
+**設定例:**
+
+```bash
+# Fixed chunking (200文字、50文字オーバーラップ)
+MUSUBI_CHUNK_TYPE=fixed MUSUBI_CHUNK_SIZE=200 MUSUBI_CHUNK_OVERLAP=50 cargo run --release
+
+# Semantic chunking
+MUSUBI_CHUNK_TYPE=semantic MUSUBI_CHUNK_MIN_SIZE=100 MUSUBI_CHUNK_MAX_SIZE=500 MUSUBI_CHUNK_THRESHOLD=0.6 cargo run --release
+```
+
+**ストレージ:**
+
+チャンク有効時、`data/chunks.jsonl` にチャンクデータが保存されます。
+
 ### Embeddingサーバー
 
 | 変数 | 説明 | デフォルト |
@@ -210,7 +243,11 @@ curl -s -X POST http://127.0.0.1:8080/search \
       "hybrid_score": 0.83,
       "title": "Hello",
       "source": "example",
-      "tags": "news"
+      "tags": "news",
+      "best_chunk": {
+        "chunk_index": 2,
+        "text_preview": "This is the most relevant part of the document..."
+      }
     }
   ]
 }
@@ -220,6 +257,9 @@ curl -s -X POST http://127.0.0.1:8080/search \
 - `distance`: ベクトル距離（BM25のみの候補では省略）
 - `bm25_score`: BM25スコア（ベクトルのみの候補では省略）
 - `hybrid_score`: ハイブリッドスコア（alpha加重平均）
+- `best_chunk`: 最もマッチしたチャンク情報（チャンク有効時のみ）
+  - `chunk_index`: ドキュメント内のチャンクインデックス
+  - `text_preview`: チャンクテキストのプレビュー（先頭100文字程度）
 
 **スコア計算:**
 - `distance`: コサイン距離 (小さいほど類似)
@@ -265,14 +305,52 @@ println!("{:?}", results2);
 
 ## 構成 (Clean Architecture)
 
+### Runtime Flow (実行時の呼び出し)
+
+```mermaid
+flowchart LR
+    Client["Client / SDK"] --> API["interface/http<br/>axum handlers"]
+    API --> Service["application/service<br/>DocumentService (Use Cases)"]
+
+    Service --> Ports["domain/ports<br/>Embedder / VectorIndex / RecordStore / ChunkStore / Chunker"]
+    Ports -.implemented by.-> Infra["infrastructure/* adapters"]
+
+    Infra --> HNSW["index/hnsw<br/>Vector Index"]
+    Infra --> Records["storage/record_store<br/>data/records.jsonl"]
+    Infra --> Chunks["storage/chunk_store<br/>data/chunks.jsonl"]
+    Infra --> WAL["storage/wal<br/>hnsw.wal"]
+    Infra --> EmbedHTTP["embedding/http<br/>Embedding API"]
+    Infra --> EmbedPy["embedding/python<br/>python/embed_text.py"]
+    Infra --> Chunking["chunking/*<br/>Fixed / Semantic / Noop"]
+
+    Service --> BM25["infrastructure/search<br/>BM25 index (in-memory)"]
+    Service --> Snap["snapshot<br/>hnsw.bin"]
+```
+
+### Compile-time Dependency (依存方向)
+
+```mermaid
+flowchart RL
+    Infra["infrastructure/*"] --> Ports["domain/ports"]
+    Application["application/*"] --> Domain["domain/model + types + ports"]
+    Interface["interface/http"] --> Application
+    Main["main.rs (DI)"] --> Interface
+    Main --> Application
+    Main --> Infra
+```
+
 ```
 src/
 ├── domain/          # ドメインモデル/型/ポート
 ├── application/     # ユースケース (DocumentService)
 ├── infrastructure/  # HNSW/永続化/埋め込み実装
-│   └── embedding/
-│       ├── http.rs  # HTTP Embedder (事前ロード対応)
-│       └── python.rs# Python Embedder (プロセス起動)
+│   ├── chunking/    # チャンク分割 (noop/fixed/semantic)
+│   ├── embedding/
+│   │   ├── http.rs  # HTTP Embedder (事前ロード対応)
+│   │   └── python.rs# Python Embedder (プロセス起動)
+│   └── storage/
+│       ├── chunk_store.rs  # チャンク永続化
+│       └── record_store.rs # レコード永続化
 ├── interface/       # HTTP API (axum)
 └── main.rs          # 起動/DI
 
@@ -300,6 +378,7 @@ python/
 
 - HNSWスナップショット: `hnsw.bin`
 - レコード/埋め込み: `data/records.jsonl`
+- チャンクデータ: `data/chunks.jsonl` (チャンク有効時のみ)
 - WAL (Write-Ahead Log): `hnsw.wal`
 
 ## WAL (Write-Ahead Log)
