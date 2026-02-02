@@ -10,6 +10,7 @@
 - 単一ファイルへのスナップショット保存/復元
 - **WAL (Write-Ahead Log) による再起動耐性**
 - REST APIでの挿入/検索/取得/更新/削除
+- **BM25 + ベクトルのハイブリッドサーチ**
 - 埋め込みモデルの事前ロード対応
 
 ## クイックスタート
@@ -121,11 +122,40 @@ curl -s -X POST http://127.0.0.1:8080/documents \
 
 ### POST /search
 
+ベクトル検索とBM25キーワード検索を組み合わせたハイブリッドサーチに対応しています。
+
+**パラメータ:**
+
+| パラメータ | 型 | 説明 | デフォルト |
+|-----------|-----|------|-----------|
+| `text` | string | 検索クエリ (embedding生成 + BM25検索) | - |
+| `embedding` | float[] | 直接指定する埋め込みベクトル | - |
+| `k` | int | 取得件数 | 5 |
+| `ef` | int | 検索の探索幅 | 100 |
+| `alpha` | float | ハイブリッドスコアの重み (0.0=BM25のみ, 1.0=ベクトルのみ) | 0.7 |
+
+**注意:** `alpha=0.0` (BM25のみ) を指定する場合は `text` パラメータが必須です。
+
+**リクエスト例:**
+
 ```bash
+# 標準検索 (alpha=0.7)
 curl -s -X POST http://127.0.0.1:8080/search \
   -H 'content-type: application/json' \
-  -d '{"text":"Hello world","k":5,"ef":100}'
+  -d '{"text":"Hello world","k":5}'
+
+# BM25重視 (alpha=0.3)
+curl -s -X POST http://127.0.0.1:8080/search \
+  -H 'content-type: application/json' \
+  -d '{"text":"Hello world","k":5,"alpha":0.3}'
+
+# ベクトル検索のみ (alpha=1.0)
+curl -s -X POST http://127.0.0.1:8080/search \
+  -H 'content-type: application/json' \
+  -d '{"text":"Hello world","k":5,"alpha":1.0}'
 ```
+
+**レスポンス例:**
 
 ```json
 {
@@ -134,6 +164,8 @@ curl -s -X POST http://127.0.0.1:8080/search \
       "index_id": 0,
       "id": "doc-1",
       "distance": 0.1234,
+      "bm25_score": 2.45,
+      "hybrid_score": 0.83,
       "title": "Hello",
       "source": "example",
       "tags": "news"
@@ -141,6 +173,17 @@ curl -s -X POST http://127.0.0.1:8080/search \
   ]
 }
 ```
+
+**レスポンスフィールド:**
+- `distance`: ベクトル距離（BM25のみの候補では省略）
+- `bm25_score`: BM25スコア（ベクトルのみの候補では省略）
+- `hybrid_score`: ハイブリッドスコア（alpha加重平均）
+
+**スコア計算:**
+- `distance`: コサイン距離 (小さいほど類似)
+- `bm25_score`: BM25スコア (大きいほど関連)
+- `hybrid_score`: 正規化された融合スコア (大きいほど関連)
+  - `hybrid_score = alpha * vector_score + (1 - alpha) * bm25_score`
 
 ### GET /documents/:id
 

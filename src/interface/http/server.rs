@@ -53,6 +53,8 @@ struct SearchRequest {
     embedding: Option<Vec<f32>>,
     k: Option<usize>,
     ef: Option<usize>,
+    /// Weight for vector score in hybrid search (0.0 = BM25 only, 1.0 = vector only)
+    alpha: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -199,6 +201,7 @@ async fn search_handler(
         embedding: req.embedding,
         k: req.k,
         ef: req.ef,
+        alpha: req.alpha,
     };
 
     let state = state.clone();

@@ -1,9 +1,10 @@
 use crate::application::error::AppError;
 use crate::domain::model::{Record, StoredRecord};
 use crate::domain::ports::{Embedder, RecordStore, VectorIndex, VectorIndexFactory};
+use crate::infrastructure::search::Bm25Index;
 use crate::infrastructure::storage::wal::{self, WalConfig, WalWriter};
 use serde::Serialize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 /// Configuration for tombstone-based compaction
@@ -45,6 +46,7 @@ pub struct DocumentService {
     wal_config: Option<WalConfig>,
     tombstone_config: TombstoneConfig,
     tombstone_count: usize,
+    bm25_index: Bm25Index,
 }
 
 #[derive(Debug, Clone)]
@@ -69,13 +71,21 @@ pub struct SearchCommand {
     pub embedding: Option<Vec<f32>>,
     pub k: Option<usize>,
     pub ef: Option<usize>,
+    /// Weight for vector score in hybrid search (0.0 = BM25 only, 1.0 = vector only)
+    /// Default is 0.7
+    pub alpha: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SearchHit {
     pub index_id: usize,
     pub id: String,
-    pub distance: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub distance: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bm25_score: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hybrid_score: Option<f64>,
     pub title: Option<String>,
     pub source: Option<String>,
     pub tags: Option<String>,
@@ -155,6 +165,16 @@ impl DocumentService {
             )));
         }
 
+        // Build BM25 index from records (excluding tombstones)
+        let mut bm25_index = Bm25Index::new();
+        for (idx, record) in records.iter().enumerate() {
+            if !record.deleted {
+                if let Some(text) = build_text(None, &record.record) {
+                    bm25_index.add(idx, &text);
+                }
+            }
+        }
+
         // After successful load, save snapshot and truncate WAL
         let mut service = Self {
             index,
@@ -169,6 +189,7 @@ impl DocumentService {
             wal_config: config.wal_config,
             tombstone_config: config.tombstone_config,
             tombstone_count,
+            bm25_index,
         };
 
         // Only truncate WAL if we successfully replayed v2 operations
@@ -194,7 +215,7 @@ impl DocumentService {
 
         let text = build_text(cmd.text.as_deref(), &cmd.record)
             .ok_or_else(|| AppError::BadRequest("text/title/body is required".to_string()))?;
-        let embedding = self.embed_single(text)?;
+        let embedding = self.embed_single(text.clone())?;
 
         let stored = StoredRecord::new(cmd.record.clone(), embedding.clone());
 
@@ -206,6 +227,10 @@ impl DocumentService {
         // Then update index and records
         let index_id = self.index.insert(embedding.clone());
         self.records.push(stored.clone());
+
+        // Update BM25 index
+        self.bm25_index.add(index_id, &text);
+
         self.index.save(&self.snapshot_path)?;
         self.record_store.append(&stored)?;
 
@@ -263,9 +288,17 @@ impl DocumentService {
             self.records[index_id].deleted = true;
             self.tombstone_count += 1;
 
+            // Update BM25: remove old, add new
+            self.bm25_index.remove(index_id);
+
             // Append new record and add to index
             let new_index_id = self.index.insert(embedding.clone());
             self.records.push(new_stored.clone());
+
+            // Add to BM25 index
+            if let Some(text) = build_text(None, &updated) {
+                self.bm25_index.add(new_index_id, &text);
+            }
 
             // Save state
             self.index.save(&self.snapshot_path)?;
@@ -293,6 +326,12 @@ impl DocumentService {
 
             // Update record in place
             self.records[index_id] = stored;
+
+            // Update BM25 index
+            if let Some(text) = build_text(None, &updated) {
+                self.bm25_index.update(index_id, &text);
+            }
+
             self.record_store.save_all(&self.records)?;
 
             // Check if WAL rotation is needed
@@ -317,6 +356,10 @@ impl DocumentService {
         // Mark as tombstone (soft delete)
         self.records[index_id].deleted = true;
         self.tombstone_count += 1;
+
+        // Remove from BM25 index
+        self.bm25_index.remove(index_id);
+
         self.record_store.save_all(&self.records)?;
 
         // Check if compaction is needed
@@ -331,53 +374,129 @@ impl DocumentService {
     pub fn search(&self, cmd: SearchCommand) -> Result<Vec<SearchHit>, AppError> {
         let k = cmd.k.unwrap_or(self.default_k);
         let ef = cmd.ef.unwrap_or(self.default_ef);
+        let alpha = cmd.alpha.unwrap_or(0.7).clamp(0.0, 1.0);
+
+        let query_text = cmd.text.clone();
+
+        // alpha=0.0 (BM25-only) requires text for BM25 search
+        if alpha == 0.0 && query_text.is_none() {
+            return Err(AppError::BadRequest(
+                "alpha=0.0 (BM25-only) requires 'text' parameter".to_string(),
+            ));
+        }
+
         let embedding = if let Some(embedding) = cmd.embedding {
             embedding
-        } else if let Some(text) = cmd.text {
-            self.embed_single(text)?
+        } else if let Some(ref text) = query_text {
+            self.embed_single(text.clone())?
         } else {
             return Err(AppError::BadRequest("text or embedding is required".to_string()));
         };
 
-        // Request more results to account for tombstones
-        let mut search_k = k;
-        let mut search_ef = ef;
-        let mut hits = Vec::new();
+        // Get vector search results (request more to account for tombstones and hybrid merging)
+        let search_k = (k * 4).max(100);
+        let search_ef = ef.max(search_k);
+        let vector_results = self.index.search(&embedding, search_k, search_ef);
 
-        // Retry with larger k if we don't get enough non-deleted results
-        loop {
-            let results = self.index.search(&embedding, search_k, search_ef);
-            hits.clear();
-
-            for result in results {
-                if let Some(record) = self.records.get(result.id) {
-                    // Skip tombstones
-                    if record.deleted {
-                        continue;
-                    }
-                    hits.push(SearchHit {
-                        index_id: result.id,
-                        id: record.record.id.clone(),
-                        distance: result.distance,
-                        title: record.record.title.clone(),
-                        source: record.record.source.clone(),
-                        tags: record.record.tags.clone(),
-                    });
-                    if hits.len() >= k {
-                        break;
-                    }
+        // Collect vector scores (filter tombstones)
+        let mut vector_scores: HashMap<usize, f32> = HashMap::new();
+        for result in vector_results {
+            if let Some(record) = self.records.get(result.id) {
+                if !record.deleted {
+                    vector_scores.insert(result.id, result.distance);
                 }
             }
-
-            // If we have enough results or we've already expanded significantly, stop
-            if hits.len() >= k || search_k >= k * 4 {
-                break;
-            }
-
-            // Expand search to get more candidates
-            search_k = search_k * 2;
-            search_ef = search_ef.max(search_k);
         }
+
+        // Get BM25 results if we have a text query
+        let bm25_scores: HashMap<usize, f64> = if let Some(ref text) = query_text {
+            self.bm25_index
+                .search(text, search_k)
+                .into_iter()
+                .filter(|(id, _)| {
+                    self.records.get(*id).map(|r| !r.deleted).unwrap_or(false)
+                })
+                .collect()
+        } else {
+            HashMap::new()
+        };
+
+        // Combine candidates based on alpha:
+        // alpha == 1.0 → vector only
+        // alpha == 0.0 → BM25 only
+        // otherwise   → union of both
+        let all_candidates: HashSet<usize> = if alpha == 1.0 {
+            vector_scores.keys().copied().collect()
+        } else if alpha == 0.0 {
+            bm25_scores.keys().copied().collect()
+        } else {
+            vector_scores
+                .keys()
+                .chain(bm25_scores.keys())
+                .copied()
+                .collect()
+        };
+
+        // Normalize scores and compute hybrid score
+        // Vector: convert distance to similarity (1 - distance), then normalize
+        // BM25: normalize to [0, 1]
+        let max_bm25 = bm25_scores.values().cloned().fold(0.0f64, f64::max);
+        let min_distance = vector_scores.values().cloned().fold(f32::MAX, f32::min);
+        let max_distance = vector_scores.values().cloned().fold(0.0f32, f32::max);
+
+        let mut hits: Vec<SearchHit> = all_candidates
+            .into_iter()
+            .filter_map(|index_id| {
+                let record = self.records.get(index_id)?;
+                if record.deleted {
+                    return None;
+                }
+
+                let distance = vector_scores.get(&index_id).copied();
+                let bm25_raw = bm25_scores.get(&index_id).copied();
+
+                // Normalize vector score: convert distance to [0, 1] similarity
+                // BM25-only candidates (no distance) get vector_score = 0.0 for fair hybrid ranking
+                let vector_score = if let Some(d) = distance {
+                    if max_distance > min_distance {
+                        1.0 - ((d - min_distance) / (max_distance - min_distance)) as f64
+                    } else {
+                        1.0 - d as f64
+                    }
+                } else {
+                    0.0
+                };
+
+                // Normalize BM25 score to [0, 1]
+                let bm25_score = if let Some(bm25) = bm25_raw {
+                    if max_bm25 > 0.0 { bm25 / max_bm25 } else { 0.0 }
+                } else {
+                    0.0
+                };
+
+                // Hybrid score: alpha * vector + (1 - alpha) * bm25
+                let hybrid_score = alpha * vector_score + (1.0 - alpha) * bm25_score;
+
+                Some(SearchHit {
+                    index_id,
+                    id: record.record.id.clone(),
+                    distance,
+                    bm25_score: bm25_raw,
+                    hybrid_score: Some(hybrid_score),
+                    title: record.record.title.clone(),
+                    source: record.record.source.clone(),
+                    tags: record.record.tags.clone(),
+                })
+            })
+            .collect();
+
+        // Sort by hybrid score (descending)
+        hits.sort_by(|a, b| {
+            b.hybrid_score
+                .partial_cmp(&a.hybrid_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        hits.truncate(k);
 
         Ok(hits)
     }
@@ -506,8 +625,17 @@ impl DocumentService {
         self.records.retain(|r| !r.deleted);
         self.tombstone_count = 0;
 
-        // Rebuild index with only active records
+        // Rebuild vector index with only active records
         self.index = self.index_factory.rebuild(&self.records);
+
+        // Rebuild BM25 index
+        self.bm25_index = Bm25Index::new();
+        for (idx, record) in self.records.iter().enumerate() {
+            if let Some(text) = build_text(None, &record.record) {
+                self.bm25_index.add(idx, &text);
+            }
+        }
+
         self.index.save(&self.snapshot_path)?;
         self.record_store.save_all(&self.records)?;
 
