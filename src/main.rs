@@ -1,19 +1,23 @@
 use musubi::application::error::AppError;
-use musubi::application::service::{DocumentService, ServiceConfig, TombstoneConfig};
-use musubi::domain::ports::Embedder;
+use musubi::application::service::{ChunkConfig, DocumentService, ServiceConfig, TombstoneConfig};
+use musubi::domain::ports::{ChunkStore, Chunker, Embedder};
+use musubi::infrastructure::chunking::{FixedChunker, SemanticChunker};
 use musubi::infrastructure::embedding::http::HttpEmbedder;
 use musubi::infrastructure::embedding::python::PythonEmbedder;
 use musubi::infrastructure::index::adapter::HnswIndexFactory;
+use musubi::infrastructure::storage::chunk_store::JsonlChunkStore;
 use musubi::infrastructure::storage::record_store::JsonlRecordStore;
 use musubi::infrastructure::storage::wal::WalConfig;
 use musubi::interface::http::server::serve;
 use std::io;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
     let snapshot_path = PathBuf::from("hnsw.bin");
     let records_path = PathBuf::from("data/records.jsonl");
+    let chunks_path = PathBuf::from("data/chunks.jsonl");
     let addr = std::env::var("MUSUBI_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".to_string());
 
     // WAL configuration
@@ -83,17 +87,10 @@ async fn main() -> io::Result<()> {
         }
     };
 
-    let config = ServiceConfig {
-        snapshot_path,
-        default_k: 5,
-        default_ef: 100,
-        wal_config,
-        tombstone_config,
-    };
-
-    let embedder: Box<dyn Embedder> = if let Ok(url) = std::env::var("MUSUBI_EMBED_URL") {
+    // Embedder configuration (needed before chunk config for semantic chunker)
+    let embedder: Arc<dyn Embedder> = if let Ok(url) = std::env::var("MUSUBI_EMBED_URL") {
         println!("Using HTTP embedder: {}", url);
-        Box::new(HttpEmbedder::new(url)?)
+        Arc::new(HttpEmbedder::new(url)?)
     } else {
         let python_bin =
             std::env::var("MUSUBI_PYTHON").unwrap_or_else(|_| "python3".to_string());
@@ -101,16 +98,115 @@ async fn main() -> io::Result<()> {
             "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2".to_string()
         });
         println!("Using Python embedder: {}", model);
-        Box::new(PythonEmbedder::new(python_bin, model))
+        Arc::new(PythonEmbedder::new(python_bin, model))
     };
+
+    // Chunk configuration
+    let (chunk_config, chunker, chunk_store): (
+        ChunkConfig,
+        Option<Box<dyn Chunker>>,
+        Option<Box<dyn ChunkStore>>,
+    ) = {
+        let chunk_type = std::env::var("MUSUBI_CHUNK_TYPE")
+            .unwrap_or_else(|_| "none".to_string())
+            .to_lowercase();
+
+        match chunk_type.as_str() {
+            "fixed" => {
+                let chunk_size = std::env::var("MUSUBI_CHUNK_SIZE")
+                    .ok()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(512);
+                let overlap = std::env::var("MUSUBI_CHUNK_OVERLAP")
+                    .ok()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(50);
+
+                println!("Chunking: fixed (size={}, overlap={})", chunk_size, overlap);
+
+                (
+                    ChunkConfig::Fixed { chunk_size, overlap },
+                    Some(Box::new(FixedChunker::new(chunk_size, overlap)) as Box<dyn Chunker>),
+                    Some(Box::new(JsonlChunkStore::new(&chunks_path)) as Box<dyn ChunkStore>),
+                )
+            }
+            "semantic" => {
+                let min_chunk_size = std::env::var("MUSUBI_CHUNK_MIN_SIZE")
+                    .ok()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(100);
+                let max_chunk_size = std::env::var("MUSUBI_CHUNK_MAX_SIZE")
+                    .ok()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(1000);
+                let similarity_threshold = std::env::var("MUSUBI_CHUNK_THRESHOLD")
+                    .ok()
+                    .and_then(|s| s.parse::<f32>().ok())
+                    .unwrap_or(0.5);
+
+                println!(
+                    "Chunking: semantic (min={}, max={}, threshold={})",
+                    min_chunk_size, max_chunk_size, similarity_threshold
+                );
+
+                (
+                    ChunkConfig::Semantic {
+                        min_chunk_size,
+                        max_chunk_size,
+                        similarity_threshold,
+                    },
+                    Some(Box::new(SemanticChunker::new(
+                        min_chunk_size,
+                        max_chunk_size,
+                        similarity_threshold,
+                        embedder.clone(),
+                    )) as Box<dyn Chunker>),
+                    Some(Box::new(JsonlChunkStore::new(&chunks_path)) as Box<dyn ChunkStore>),
+                )
+            }
+            _ => {
+                // "none" or any other value - no chunking (backward compatible)
+                println!("Chunking: disabled (documents indexed as-is)");
+                (ChunkConfig::None, None, None)
+            }
+        }
+    };
+
+    let config = ServiceConfig {
+        snapshot_path,
+        default_k: 5,
+        default_ef: 100,
+        wal_config,
+        tombstone_config,
+        chunk_config,
+    };
+
+    // Convert Arc<dyn Embedder> to Box<dyn Embedder> for the service
+    let embedder_box: Box<dyn Embedder> = Box::new(ArcEmbedder(embedder));
 
     let record_store = Box::new(JsonlRecordStore::new(records_path));
     let index_factory = Box::new(HnswIndexFactory::new(16, 200));
 
-    let service = DocumentService::load(config, embedder, record_store, index_factory)
-        .map_err(map_app_error)?;
+    let service = DocumentService::load(
+        config,
+        embedder_box,
+        record_store,
+        index_factory,
+        chunker,
+        chunk_store,
+    )
+    .map_err(map_app_error)?;
 
     serve(addr, service).await
+}
+
+/// Wrapper to convert Arc<dyn Embedder> to Box<dyn Embedder>
+struct ArcEmbedder(Arc<dyn Embedder>);
+
+impl Embedder for ArcEmbedder {
+    fn embed(&self, texts: Vec<String>) -> io::Result<Vec<Vec<f32>>> {
+        self.0.embed(texts)
+    }
 }
 
 fn map_app_error(err: AppError) -> io::Error {
