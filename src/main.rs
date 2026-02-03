@@ -68,22 +68,42 @@ async fn main() -> io::Result<()> {
             .ok()
             .and_then(|s| s.parse::<f64>().ok());
 
-        if max_tombstones.is_some() || max_ratio.is_some() {
-            println!("Tombstone compaction:");
-            if let Some(max) = max_tombstones {
-                println!("  max_count: {}", max);
+        // Early validation for conflicting settings (better UX than failing at load time)
+        if max_tombstones.is_some() && max_ratio.is_some() {
+            eprintln!(
+                "Error: Cannot set both MUSUBI_TOMBSTONE_MAX_COUNT and MUSUBI_TOMBSTONE_MAX_RATIO"
+            );
+            std::process::exit(1);
+        }
+
+        if let Some(ratio) = max_ratio {
+            if ratio.is_nan() || !(0.0..=1.0).contains(&ratio) {
+                eprintln!("Error: MUSUBI_TOMBSTONE_MAX_RATIO must be between 0.0 and 1.0");
+                std::process::exit(1);
             }
-            if let Some(ratio) = max_ratio {
-                println!("  max_ratio: {:.1}%", ratio * 100.0);
+        }
+
+        // Build config and log
+        match (max_tombstones, max_ratio) {
+            (Some(max), None) => {
+                println!("Tombstone compaction: max_count = {}", max);
+                TombstoneConfig {
+                    max_tombstones: Some(max),
+                    max_tombstone_ratio: None,
+                }
             }
-            TombstoneConfig {
-                max_tombstones,
-                max_tombstone_ratio: max_ratio,
+            (None, Some(ratio)) => {
+                println!("Tombstone compaction: max_ratio = {:.1}%", ratio * 100.0);
+                TombstoneConfig {
+                    max_tombstones: None,
+                    max_tombstone_ratio: Some(ratio),
+                }
             }
-        } else {
-            // Use default (30% ratio)
-            println!("Tombstone compaction: default (30% ratio)");
-            TombstoneConfig::default()
+            (None, None) => {
+                println!("Tombstone compaction: default (30% ratio)");
+                TombstoneConfig::default()
+            }
+            (Some(_), Some(_)) => unreachable!(), // Already handled above
         }
     };
 

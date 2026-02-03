@@ -47,10 +47,8 @@ impl SemanticChunker {
                     // Not a sentence boundary if followed by a digit (e.g., "3.14")
                     // or if it's an abbreviation (simple heuristic: single letter before)
                     let next_is_space_or_end = i + 1 >= chars.len() || chars[i + 1].is_whitespace();
-                    let prev_is_single_letter = i > 0
-                        && i > 1
-                        && chars[i - 1].is_alphabetic()
-                        && (i < 2 || !chars[i - 2].is_alphabetic());
+                    let prev_is_single_letter =
+                        i > 1 && chars[i - 1].is_alphabetic() && !chars[i - 2].is_alphabetic();
 
                     next_is_space_or_end && !prev_is_single_letter
                 } else {
