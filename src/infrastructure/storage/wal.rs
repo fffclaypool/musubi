@@ -33,9 +33,7 @@ pub enum WalOp {
         deleted: bool,
     },
     /// Mark a record as deleted (tombstone)
-    Delete {
-        id: String,
-    },
+    Delete { id: String },
     /// Append a new record (for tombstone-append pattern, idempotent)
     Append {
         id: String,
@@ -96,7 +94,10 @@ impl WalWriter {
             } else if &magic != MAGIC_V3 {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    format!("invalid wal magic: expected {:?}, got {:?}", MAGIC_V3, magic),
+                    format!(
+                        "invalid wal magic: expected {:?}, got {:?}",
+                        MAGIC_V3, magic
+                    ),
                 ));
             }
 
@@ -261,7 +262,10 @@ pub fn replay<P: AsRef<Path>>(path: P) -> io::Result<Vec<WalOp>> {
     } else if &magic != MAGIC_V3 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("invalid wal magic: expected {:?}, got {:?}", MAGIC_V3, magic),
+            format!(
+                "invalid wal magic: expected {:?}, got {:?}",
+                MAGIC_V3, magic
+            ),
         ));
     }
 
@@ -900,8 +904,14 @@ mod tests {
         assert_eq!(records.len(), 3); // existing-1 + existing-2 (tombstoned) + new-1
 
         // Find and verify the updated existing-1
-        let existing1 = records.iter().find(|r| r.record.id == "existing-1").unwrap();
-        assert_eq!(existing1.record.title, Some("Updated Existing 1".to_string()));
+        let existing1 = records
+            .iter()
+            .find(|r| r.record.id == "existing-1")
+            .unwrap();
+        assert_eq!(
+            existing1.record.title,
+            Some("Updated Existing 1".to_string())
+        );
         assert_eq!(existing1.record.body, Some("Updated body".to_string()));
         assert_eq!(existing1.embedding, vec![0.8, 0.2]);
         assert!(!existing1.deleted);
@@ -914,7 +924,10 @@ mod tests {
         assert!(!new1.deleted);
 
         // Verify existing-2 was marked as deleted (tombstoned)
-        let existing2 = records.iter().find(|r| r.record.id == "existing-2").unwrap();
+        let existing2 = records
+            .iter()
+            .find(|r| r.record.id == "existing-2")
+            .unwrap();
         assert!(existing2.deleted);
 
         std::fs::remove_file(&wal_path).ok();
@@ -1025,7 +1038,7 @@ mod tests {
             let mut file = File::create(&wal_path).unwrap();
             file.write_all(b"MUSUBIW1").unwrap(); // v1 magic
             file.write_all(&1u32.to_le_bytes()).unwrap(); // version 1
-            // Write a simple insert: OP_INSERT(1) + dim(2) + [1.0, 0.0]
+                                                          // Write a simple insert: OP_INSERT(1) + dim(2) + [1.0, 0.0]
             file.write_all(&[1u8]).unwrap(); // OP_INSERT
             file.write_all(&2u32.to_le_bytes()).unwrap(); // dim
             file.write_all(&1.0f32.to_le_bytes()).unwrap();

@@ -31,8 +31,8 @@ impl RecordStore for JsonlRecordStore {
             match serde_json::from_str::<StoredRecord>(trimmed) {
                 Ok(record) => records.push(record),
                 Err(_) => {
-                    let record: Record =
-                        serde_json::from_str(trimmed).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+                    let record: Record = serde_json::from_str(trimmed)
+                        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
                     records.push(StoredRecord::new(record, Vec::new()));
                 }
             }
@@ -44,9 +44,12 @@ impl RecordStore for JsonlRecordStore {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let mut file = OpenOptions::new().create(true).append(true).open(&self.path)?;
-        let line =
-            serde_json::to_string(record).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
+        let line = serde_json::to_string(record)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
         writeln!(file, "{}", line)?;
         Ok(())
     }

@@ -218,7 +218,13 @@ impl HnswIndex {
 
     /// 指定されたレベルでef個の最近傍を探す
     /// (node_id, distance) のソート済みベクトルを返す
-    fn search_layer(&self, query: &[f32], entry: usize, ef: usize, level: usize) -> Vec<(usize, f32)> {
+    fn search_layer(
+        &self,
+        query: &[f32],
+        entry: usize,
+        ef: usize,
+        level: usize,
+    ) -> Vec<(usize, f32)> {
         let mut visited = HashSet::new();
         visited.insert(entry);
 

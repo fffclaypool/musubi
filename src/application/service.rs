@@ -1,6 +1,8 @@
 use crate::application::error::AppError;
 use crate::domain::model::{Record, StoredChunk, StoredRecord};
-use crate::domain::ports::{ChunkStore, Chunker, Embedder, RecordStore, VectorIndex, VectorIndexFactory};
+use crate::domain::ports::{
+    ChunkStore, Chunker, Embedder, RecordStore, VectorIndex, VectorIndexFactory,
+};
 use crate::infrastructure::search::Bm25Index;
 use crate::infrastructure::storage::wal::{self, WalConfig, WalWriter};
 use serde::{Deserialize, Serialize};
@@ -298,10 +300,8 @@ impl DocumentService {
 
         // Critical: Handle migration case where chunking is enabled but no chunks exist
         // When chunker is set but chunks is empty, we need to migrate existing records
-        let needs_migration = chunking_enabled
-            && chunks.is_empty()
-            && !records.is_empty()
-            && chunker.is_some();
+        let needs_migration =
+            chunking_enabled && chunks.is_empty() && !records.is_empty() && chunker.is_some();
 
         // Critical: Handle WAL recovery for chunking mode
         // WAL only tracks record operations, not chunks. After WAL replay in chunking mode,
@@ -430,7 +430,10 @@ impl DocumentService {
             None => return Ok(()), // No chunker, nothing to do
         };
 
-        println!("Starting migration: {} records to chunk...", self.records.len());
+        println!(
+            "Starting migration: {} records to chunk...",
+            self.records.len()
+        );
 
         // Collect all texts that need to be chunked
         let mut all_chunks_data: Vec<(usize, Vec<crate::domain::model::Chunk>)> = Vec::new();
@@ -483,11 +486,8 @@ impl DocumentService {
                 let embedding = all_embeddings[embedding_idx].clone();
                 embedding_idx += 1;
 
-                let stored_chunk = StoredChunk::new(
-                    record_id.clone(),
-                    chunk.clone(),
-                    embedding.clone(),
-                );
+                let stored_chunk =
+                    StoredChunk::new(record_id.clone(), chunk.clone(), embedding.clone());
 
                 // Add to vector index
                 self.index.insert(embedding);
@@ -520,7 +520,11 @@ impl DocumentService {
             return Err(AppError::BadRequest("id is required".to_string()));
         }
         // Check for existing non-deleted record with same ID
-        if self.records.iter().any(|r| r.record.id == cmd.record.id && !r.deleted) {
+        if self
+            .records
+            .iter()
+            .any(|r| r.record.id == cmd.record.id && !r.deleted)
+        {
             return Err(AppError::Conflict("id already exists".to_string()));
         }
 
@@ -555,11 +559,8 @@ impl DocumentService {
             // Create and store chunks, add to vector index
             let mut first_index_id = None;
             for (chunk, embedding) in text_chunks.into_iter().zip(embeddings.into_iter()) {
-                let stored_chunk = StoredChunk::new(
-                    cmd.record.id.clone(),
-                    chunk.clone(),
-                    embedding.clone(),
-                );
+                let stored_chunk =
+                    StoredChunk::new(cmd.record.id.clone(), chunk.clone(), embedding.clone());
 
                 // Add chunk embedding to vector index
                 let chunk_index_id = self.index.insert(embedding);
@@ -638,7 +639,9 @@ impl DocumentService {
 
         // Get text for embedding if needed
         let text_for_embedding = if needs_embedding {
-            let text = cmd.text.or_else(|| build_text(None, &updated))
+            let text = cmd
+                .text
+                .or_else(|| build_text(None, &updated))
                 .ok_or_else(|| AppError::BadRequest("text/title/body is required".to_string()))?;
             if text.trim().is_empty() {
                 return Err(AppError::BadRequest("text must not be empty".to_string()));
@@ -696,11 +699,8 @@ impl DocumentService {
                 // Create and store new chunks, add to vector index
                 let mut first_index_id = None;
                 for (chunk, emb) in text_chunks.into_iter().zip(embeddings.into_iter()) {
-                    let stored_chunk = StoredChunk::new(
-                        updated.id.clone(),
-                        chunk.clone(),
-                        emb.clone(),
-                    );
+                    let stored_chunk =
+                        StoredChunk::new(updated.id.clone(), chunk.clone(), emb.clone());
 
                     // Add chunk embedding to vector index
                     let chunk_index_id = self.index.insert(emb);
@@ -865,7 +865,9 @@ impl DocumentService {
             ));
         }
         if alpha > 0.0 && query_text.is_none() && cmd.embedding.is_none() {
-            return Err(AppError::BadRequest("text or embedding is required".to_string()));
+            return Err(AppError::BadRequest(
+                "text or embedding is required".to_string(),
+            ));
         }
 
         let search_k = (k * 4).max(100);
@@ -876,77 +878,80 @@ impl DocumentService {
 
         // Get vector search results (skip if alpha=0.0, BM25-only)
         // When chunking is enabled, this returns chunk-level results that need to be aggregated
-        let (vector_scores, chunk_info_map): (HashMap<usize, f32>, HashMap<usize, (usize, f32)>) = if alpha == 0.0 {
-            (HashMap::new(), HashMap::new())
-        } else {
-            let embedding = if let Some(embedding) = cmd.embedding.clone() {
-                embedding
-            } else if let Some(ref text) = query_text {
-                self.embed_single(text.clone())?
+        let (vector_scores, chunk_info_map): (HashMap<usize, f32>, HashMap<usize, (usize, f32)>) =
+            if alpha == 0.0 {
+                (HashMap::new(), HashMap::new())
             } else {
-                return Err(AppError::BadRequest("text or embedding is required".to_string()));
-            };
+                let embedding = if let Some(embedding) = cmd.embedding.clone() {
+                    embedding
+                } else if let Some(ref text) = query_text {
+                    self.embed_single(text.clone())?
+                } else {
+                    return Err(AppError::BadRequest(
+                        "text or embedding is required".to_string(),
+                    ));
+                };
 
-            let vector_results = self.index.search(&embedding, search_k, search_ef);
+                let vector_results = self.index.search(&embedding, search_k, search_ef);
 
-            if chunking_enabled {
-                // Chunking mode: aggregate chunk results by parent document
-                // chunk_mapping[index_id] = (record_idx, chunk_idx)
-                let mut parent_scores: HashMap<usize, f32> = HashMap::new();
-                let mut parent_best_chunk: HashMap<usize, (usize, f32)> = HashMap::new();
+                if chunking_enabled {
+                    // Chunking mode: aggregate chunk results by parent document
+                    // chunk_mapping[index_id] = (record_idx, chunk_idx)
+                    let mut parent_scores: HashMap<usize, f32> = HashMap::new();
+                    let mut parent_best_chunk: HashMap<usize, (usize, f32)> = HashMap::new();
 
-                for result in vector_results {
-                    // Check if the chunk itself is deleted
-                    if let Some(chunk) = self.chunks.get(result.id) {
-                        if chunk.deleted {
-                            continue;
+                    for result in vector_results {
+                        // Check if the chunk itself is deleted
+                        if let Some(chunk) = self.chunks.get(result.id) {
+                            if chunk.deleted {
+                                continue;
+                            }
                         }
-                    }
 
-                    if let Some(&(record_idx, chunk_idx)) = self.chunk_mapping.get(result.id) {
-                        // Skip invalid mappings (usize::MAX sentinel)
-                        if record_idx == usize::MAX {
-                            continue;
-                        }
-                        if let Some(record) = self.records.get(record_idx) {
-                            if !record.deleted {
-                                // Use minimum distance (best match) for the parent
-                                let current_dist = parent_scores.entry(record_idx).or_insert(f32::MAX);
-                                if result.distance < *current_dist {
-                                    *current_dist = result.distance;
-                                    parent_best_chunk.insert(record_idx, (chunk_idx, result.distance));
+                        if let Some(&(record_idx, chunk_idx)) = self.chunk_mapping.get(result.id) {
+                            // Skip invalid mappings (usize::MAX sentinel)
+                            if record_idx == usize::MAX {
+                                continue;
+                            }
+                            if let Some(record) = self.records.get(record_idx) {
+                                if !record.deleted {
+                                    // Use minimum distance (best match) for the parent
+                                    let current_dist =
+                                        parent_scores.entry(record_idx).or_insert(f32::MAX);
+                                    if result.distance < *current_dist {
+                                        *current_dist = result.distance;
+                                        parent_best_chunk
+                                            .insert(record_idx, (chunk_idx, result.distance));
+                                    }
                                 }
                             }
                         }
                     }
-                }
-                (parent_scores, parent_best_chunk)
-            } else {
-                // Non-chunking mode: direct record lookup
-                let scores: HashMap<usize, f32> = vector_results
-                    .into_iter()
-                    .filter_map(|result| {
-                        self.records.get(result.id).and_then(|record| {
-                            if record.deleted {
-                                None
-                            } else {
-                                Some((result.id, result.distance))
-                            }
+                    (parent_scores, parent_best_chunk)
+                } else {
+                    // Non-chunking mode: direct record lookup
+                    let scores: HashMap<usize, f32> = vector_results
+                        .into_iter()
+                        .filter_map(|result| {
+                            self.records.get(result.id).and_then(|record| {
+                                if record.deleted {
+                                    None
+                                } else {
+                                    Some((result.id, result.distance))
+                                }
+                            })
                         })
-                    })
-                    .collect();
-                (scores, HashMap::new())
-            }
-        };
+                        .collect();
+                    (scores, HashMap::new())
+                }
+            };
 
         // Get BM25 results (document-level, not chunk-level)
         let bm25_scores: HashMap<usize, f64> = if let Some(ref text) = query_text {
             self.bm25_index
                 .search(text, search_k)
                 .into_iter()
-                .filter(|(id, _)| {
-                    self.records.get(*id).map(|r| !r.deleted).unwrap_or(false)
-                })
+                .filter(|(id, _)| self.records.get(*id).map(|r| !r.deleted).unwrap_or(false))
                 .collect()
         } else {
             HashMap::new()
@@ -1004,7 +1009,11 @@ impl DocumentService {
 
                 // Normalize BM25 score to [0, 1]
                 let bm25_score = if let Some(bm25) = bm25_raw {
-                    if max_bm25 > 0.0 { bm25 / max_bm25 } else { 0.0 }
+                    if max_bm25 > 0.0 {
+                        bm25 / max_bm25
+                    } else {
+                        0.0
+                    }
                 } else {
                     0.0
                 };
@@ -1016,9 +1025,12 @@ impl DocumentService {
                 let best_chunk = if chunking_enabled {
                     chunk_info_map.get(&record_idx).map(|&(chunk_idx, _)| {
                         // Find the chunk text for preview
-                        let text_preview = self.chunks
+                        let text_preview = self
+                            .chunks
                             .iter()
-                            .find(|c| c.parent_id == record.record.id && c.chunk.chunk_index == chunk_idx)
+                            .find(|c| {
+                                c.parent_id == record.record.id && c.chunk.chunk_index == chunk_idx
+                            })
                             .map(|c| create_text_preview(&c.chunk.text, 100));
                         ChunkInfo {
                             chunk_index: chunk_idx,
@@ -1184,19 +1196,22 @@ impl DocumentService {
             self.chunks.retain(|c| !c.deleted);
 
             // Create fake StoredRecords from chunks for index rebuilding
-            let chunk_records: Vec<StoredRecord> = self.chunks
+            let chunk_records: Vec<StoredRecord> = self
+                .chunks
                 .iter()
-                .map(|c| StoredRecord::new(
-                    Record {
-                        id: format!("{}_{}", c.parent_id, c.chunk.chunk_index),
-                        title: None,
-                        body: None,
-                        source: None,
-                        updated_at: None,
-                        tags: None,
-                    },
-                    c.embedding.clone(),
-                ))
+                .map(|c| {
+                    StoredRecord::new(
+                        Record {
+                            id: format!("{}_{}", c.parent_id, c.chunk.chunk_index),
+                            title: None,
+                            body: None,
+                            source: None,
+                            updated_at: None,
+                            tags: None,
+                        },
+                        c.embedding.clone(),
+                    )
+                })
                 .collect();
 
             self.index = self.index_factory.rebuild(&chunk_records);
@@ -1340,18 +1355,20 @@ fn build_chunk_mapping(chunks: &[StoredChunk], records: &[StoredRecord]) -> Vec<
 fn chunks_to_fake_records(chunks: &[StoredChunk]) -> Vec<StoredRecord> {
     chunks
         .iter()
-        .map(|c| StoredRecord::with_deleted(
-            Record {
-                id: format!("{}_{}", c.parent_id, c.chunk.chunk_index),
-                title: None,
-                body: None,
-                source: None,
-                updated_at: None,
-                tags: None,
-            },
-            c.embedding.clone(),
-            c.deleted,
-        ))
+        .map(|c| {
+            StoredRecord::with_deleted(
+                Record {
+                    id: format!("{}_{}", c.parent_id, c.chunk.chunk_index),
+                    title: None,
+                    body: None,
+                    source: None,
+                    updated_at: None,
+                    tags: None,
+                },
+                c.embedding.clone(),
+                c.deleted,
+            )
+        })
         .collect()
 }
 
@@ -1593,7 +1610,9 @@ mod tests {
 mod integration_tests {
     use super::*;
     use crate::domain::model::Chunk;
-    use crate::domain::ports::{ChunkStore, Chunker, Embedder, RecordStore, VectorIndex, VectorIndexFactory};
+    use crate::domain::ports::{
+        ChunkStore, Chunker, Embedder, RecordStore, VectorIndex, VectorIndexFactory,
+    };
     use crate::domain::types::SearchResult;
     use std::io;
     use std::path::Path;
@@ -1910,7 +1929,10 @@ mod integration_tests {
         .expect("Failed to load service");
 
         // Verify migration happened
-        assert!(!service.chunks.is_empty(), "Chunks should have been created during migration");
+        assert!(
+            !service.chunks.is_empty(),
+            "Chunks should have been created during migration"
+        );
         assert!(
             !service.chunk_mapping.is_empty(),
             "Chunk mapping should have been created"
@@ -1928,7 +1950,10 @@ mod integration_tests {
             })
             .expect("Search failed");
 
-        assert!(!results.is_empty(), "Search should return results after migration");
+        assert!(
+            !results.is_empty(),
+            "Search should return results after migration"
+        );
     }
 
     #[test]
@@ -1971,7 +1996,10 @@ mod integration_tests {
         assert_eq!(result.id, "doc1");
 
         // Verify chunks were created
-        assert!(!service.chunks.is_empty(), "Chunks should have been created");
+        assert!(
+            !service.chunks.is_empty(),
+            "Chunks should have been created"
+        );
 
         // Verify chunk_mapping aligns with index
         assert_eq!(
@@ -2060,7 +2088,8 @@ mod integration_tests {
             let chunk = &service.chunks[idx];
             assert_eq!(
                 chunk.chunk.chunk_index, chunk_idx,
-                "Chunk index mismatch at mapping {}", idx
+                "Chunk index mismatch at mapping {}",
+                idx
             );
         }
     }
@@ -2093,7 +2122,9 @@ mod integration_tests {
                 record: Record {
                     id: "doc1".to_string(),
                     title: Some("Test".to_string()),
-                    body: Some("Long enough content to create chunks for testing delete.".to_string()),
+                    body: Some(
+                        "Long enough content to create chunks for testing delete.".to_string(),
+                    ),
                     source: None,
                     updated_at: None,
                     tags: None,
@@ -2132,7 +2163,10 @@ mod integration_tests {
             .expect("Search failed");
 
         let doc1_in_results = results.iter().any(|r| r.id == "doc1");
-        assert!(!doc1_in_results, "Deleted document should not appear in search");
+        assert!(
+            !doc1_in_results,
+            "Deleted document should not appear in search"
+        );
     }
 
     #[test]

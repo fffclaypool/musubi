@@ -46,8 +46,7 @@ impl SemanticChunker {
                 let is_real_boundary = if c == '.' {
                     // Not a sentence boundary if followed by a digit (e.g., "3.14")
                     // or if it's an abbreviation (simple heuristic: single letter before)
-                    let next_is_space_or_end =
-                        i + 1 >= chars.len() || chars[i + 1].is_whitespace();
+                    let next_is_space_or_end = i + 1 >= chars.len() || chars[i + 1].is_whitespace();
                     let prev_is_single_letter = i > 0
                         && i > 1
                         && chars[i - 1].is_alphabetic()
@@ -294,7 +293,11 @@ mod tests {
         let chunks = chunker.chunk(text);
 
         // Should split because text exceeds max_chunk_size
-        assert!(chunks.len() >= 2, "Expected at least 2 chunks, got {}", chunks.len());
+        assert!(
+            chunks.len() >= 2,
+            "Expected at least 2 chunks, got {}",
+            chunks.len()
+        );
     }
 
     #[test]

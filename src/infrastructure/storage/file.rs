@@ -59,7 +59,10 @@ pub fn load<P: AsRef<Path>>(path: P) -> io::Result<HnswIndex> {
 
     let version = read_u32(&mut reader)?;
     if version != VERSION {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "unsupported version"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unsupported version",
+        ));
     }
 
     let dim = read_u32(&mut reader)? as usize;
@@ -145,7 +148,12 @@ mod tests {
 
     fn temp_path(name: &str) -> std::path::PathBuf {
         let mut path = std::env::temp_dir();
-        let unique = format!("{}_{}_{}", name, std::process::id(), std::time::SystemTime::now().elapsed().unwrap().as_nanos());
+        let unique = format!(
+            "{}_{}_{}",
+            name,
+            std::process::id(),
+            std::time::SystemTime::now().elapsed().unwrap().as_nanos()
+        );
         path.push(unique);
         path
     }
