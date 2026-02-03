@@ -92,8 +92,7 @@ async fn main() -> io::Result<()> {
         println!("Using HTTP embedder: {}", url);
         Arc::new(HttpEmbedder::new(url)?)
     } else {
-        let python_bin =
-            std::env::var("MUSUBI_PYTHON").unwrap_or_else(|_| "python3".to_string());
+        let python_bin = std::env::var("MUSUBI_PYTHON").unwrap_or_else(|_| "python3".to_string());
         let model = std::env::var("MUSUBI_MODEL").unwrap_or_else(|_| {
             "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2".to_string()
         });
@@ -125,7 +124,10 @@ async fn main() -> io::Result<()> {
                 println!("Chunking: fixed (size={}, overlap={})", chunk_size, overlap);
 
                 (
-                    ChunkConfig::Fixed { chunk_size, overlap },
+                    ChunkConfig::Fixed {
+                        chunk_size,
+                        overlap,
+                    },
                     Some(Box::new(FixedChunker::new(chunk_size, overlap)) as Box<dyn Chunker>),
                     Some(Box::new(JsonlChunkStore::new(&chunks_path)) as Box<dyn ChunkStore>),
                 )

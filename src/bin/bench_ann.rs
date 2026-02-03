@@ -113,16 +113,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
 
-    println!("Using: {} train vectors, {} test queries", train_limit, test_limit);
+    println!(
+        "Using: {} train vectors, {} test queries",
+        train_limit, test_limit
+    );
 
     // Prepare train and test vectors
     let train_vectors: Vec<Vec<f32>> = (0..train_limit)
         .map(|i| train_data.row(i).to_vec())
         .collect();
 
-    let test_vectors: Vec<Vec<f32>> = (0..test_limit)
-        .map(|i| test_data.row(i).to_vec())
-        .collect();
+    let test_vectors: Vec<Vec<f32>> = (0..test_limit).map(|i| test_data.row(i).to_vec()).collect();
 
     // Get or compute ground truth
     let ground_truth = if args.train_limit.is_some() {
@@ -223,7 +224,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Latency (p95): {:.3} ms", p95_latency * 1000.0);
     println!("Latency (p99): {:.3} ms", p99_latency * 1000.0);
     if let Some(size) = index_size {
-        println!("Index size: {} bytes ({:.2} MB)", size, size as f64 / 1_000_000.0);
+        println!(
+            "Index size: {} bytes ({:.2} MB)",
+            size,
+            size as f64 / 1_000_000.0
+        );
     }
 
     // Save results
@@ -264,11 +269,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Compute brute-force ground truth for subset evaluation
-fn compute_ground_truth(
-    train: &[Vec<f32>],
-    test: &[Vec<f32>],
-    k: usize,
-) -> Vec<Vec<usize>> {
+fn compute_ground_truth(train: &[Vec<f32>], test: &[Vec<f32>], k: usize) -> Vec<Vec<usize>> {
     let train_normalized: Vec<Vec<f32>> = train.iter().map(|v| normalize(v)).collect();
     let test_normalized: Vec<Vec<f32>> = test.iter().map(|v| normalize(v)).collect();
 

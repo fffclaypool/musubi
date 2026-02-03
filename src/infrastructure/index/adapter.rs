@@ -50,7 +50,12 @@ impl VectorIndex for HnswIndex {
         HnswIndex::insert(self, vector)
     }
 
-    fn search(&self, query: &[f32], k: usize, ef: usize) -> Vec<crate::domain::types::SearchResult> {
+    fn search(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+    ) -> Vec<crate::domain::types::SearchResult> {
         HnswIndex::search(self, query, k, ef)
     }
 

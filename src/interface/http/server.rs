@@ -290,7 +290,10 @@ pub async fn serve(addr: String, service: DocumentService) -> io::Result<()> {
     let app = Router::new()
         .route("/health", get(health_handler))
         .route("/embed", post(embed_handler))
-        .route("/documents", post(insert_handler).get(list_documents_handler))
+        .route(
+            "/documents",
+            post(insert_handler).get(list_documents_handler),
+        )
         .route(
             "/documents/:id",
             get(get_document_handler)

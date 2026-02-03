@@ -13,7 +13,10 @@ pub struct FixedChunker {
 
 impl FixedChunker {
     pub fn new(chunk_size: usize, overlap: usize) -> Self {
-        Self { chunk_size, overlap }
+        Self {
+            chunk_size,
+            overlap,
+        }
     }
 
     /// Find the best split point (in char index) at or before the given position,
@@ -186,7 +189,11 @@ mod tests {
         let text = "これは日本語のテキストです。分割できますか？";
         let chunks = chunker.chunk(text);
 
-        assert!(chunks.len() >= 2, "Expected multiple chunks, got {}", chunks.len());
+        assert!(
+            chunks.len() >= 2,
+            "Expected multiple chunks, got {}",
+            chunks.len()
+        );
 
         // Verify all chunks have valid offsets
         for chunk in &chunks {
