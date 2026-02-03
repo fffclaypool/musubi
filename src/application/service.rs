@@ -9,6 +9,24 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
+/// Policy for tombstone-based compaction
+#[derive(Debug, Clone)]
+pub enum TombstonePolicy {
+    /// No automatic compaction
+    Disabled,
+    /// Compact when tombstone count reaches this threshold
+    MaxCount(usize),
+    /// Compact when tombstone ratio (tombstones / total) reaches this threshold (0.0 - 1.0)
+    MaxRatio(f64),
+}
+
+impl Default for TombstonePolicy {
+    fn default() -> Self {
+        // Default: compact when 30% are tombstones
+        Self::MaxRatio(0.3)
+    }
+}
+
 /// Configuration for tombstone-based compaction
 #[derive(Debug, Clone)]
 pub struct TombstoneConfig {
@@ -23,6 +41,122 @@ impl Default for TombstoneConfig {
         Self {
             max_tombstones: None,
             max_tombstone_ratio: Some(0.3), // Default: compact when 30% are tombstones
+        }
+    }
+}
+
+impl TombstoneConfig {
+    /// Convert to TombstonePolicy, validating that at most one option is set
+    pub fn into_policy(self) -> Result<TombstonePolicy, &'static str> {
+        match (self.max_tombstones, self.max_tombstone_ratio) {
+            (None, None) => Ok(TombstonePolicy::Disabled),
+            (Some(count), None) => Ok(TombstonePolicy::MaxCount(count)),
+            (None, Some(ratio)) => {
+                if ratio.is_nan() || !(0.0..=1.0).contains(&ratio) {
+                    return Err("max_tombstone_ratio must be between 0.0 and 1.0");
+                }
+                Ok(TombstonePolicy::MaxRatio(ratio))
+            }
+            (Some(_), Some(_)) => Err("cannot set both max_tombstones and max_tombstone_ratio"),
+        }
+    }
+}
+
+/// Search mode determining the balance between vector and BM25 search
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SearchMode {
+    /// Pure vector similarity search (alpha = 1.0)
+    VectorOnly,
+    /// Pure BM25 keyword search (alpha = 0.0)
+    Bm25Only,
+    /// Hybrid search combining vector and BM25 with given weight
+    /// alpha is the weight for vector score (0.0 < alpha < 1.0)
+    Hybrid { alpha: f64 },
+}
+
+impl SearchMode {
+    /// Create SearchMode from alpha value with validation
+    ///
+    /// # Errors
+    /// Returns error if alpha is NaN or outside [0.0, 1.0]
+    pub fn from_alpha(alpha: f64) -> Result<Self, &'static str> {
+        if alpha.is_nan() {
+            return Err("alpha must not be NaN");
+        }
+        if !(0.0..=1.0).contains(&alpha) {
+            return Err("alpha must be between 0.0 and 1.0");
+        }
+
+        if alpha == 1.0 {
+            Ok(Self::VectorOnly)
+        } else if alpha == 0.0 {
+            Ok(Self::Bm25Only)
+        } else {
+            Ok(Self::Hybrid { alpha })
+        }
+    }
+
+    /// Get the alpha value for this search mode
+    pub fn alpha(&self) -> f64 {
+        match self {
+            Self::VectorOnly => 1.0,
+            Self::Bm25Only => 0.0,
+            Self::Hybrid { alpha } => *alpha,
+        }
+    }
+
+    /// Returns true if vector search is needed
+    pub fn needs_vector(&self) -> bool {
+        !matches!(self, Self::Bm25Only)
+    }
+
+    /// Returns true if BM25 search is needed
+    pub fn needs_bm25(&self) -> bool {
+        !matches!(self, Self::VectorOnly)
+    }
+}
+
+/// Internal enum representing the effect of an update operation
+enum UpdateEffect {
+    /// Only metadata changed, no re-embedding needed
+    MetadataOnly,
+    /// Content changed, re-embedding required
+    ContentChanged { text: String },
+}
+
+/// Document indexing mode - determines how documents are stored and searched
+enum IndexingMode {
+    /// Documents indexed as-is (no chunking)
+    Direct,
+    /// Documents split into chunks for finer-grained search
+    Chunked {
+        chunker: Box<dyn Chunker>,
+        chunk_store: Box<dyn ChunkStore>,
+        chunks: Vec<StoredChunk>,
+        /// Maps index ID -> (record_index, chunk_index within that record)
+        chunk_mapping: Vec<(usize, usize)>,
+    },
+}
+
+impl IndexingMode {
+    /// Returns true if chunking is enabled and has data
+    fn is_chunked_with_data(&self) -> bool {
+        matches!(self, Self::Chunked { chunk_mapping, .. } if !chunk_mapping.is_empty())
+    }
+
+    /// Get chunks (empty slice for Direct mode)
+    fn chunks(&self) -> &[StoredChunk] {
+        match self {
+            Self::Direct => &[],
+            Self::Chunked { chunks, .. } => chunks,
+        }
+    }
+
+    /// Get chunk mapping (empty slice for Direct mode)
+    fn chunk_mapping(&self) -> &[(usize, usize)] {
+        match self {
+            Self::Direct => &[],
+            Self::Chunked { chunk_mapping, .. } => chunk_mapping,
         }
     }
 }
@@ -71,16 +205,11 @@ pub struct DocumentService {
     default_ef: usize,
     wal: Option<WalWriter>,
     wal_config: Option<WalConfig>,
-    tombstone_config: TombstoneConfig,
+    tombstone_policy: TombstonePolicy,
     tombstone_count: usize,
     bm25_index: Bm25Index,
-    // Chunking support
-    chunks: Vec<StoredChunk>,
-    /// Maps index ID -> (record_index, chunk_index within that record)
-    chunk_mapping: Vec<(usize, usize)>,
-    chunk_store: Option<Box<dyn ChunkStore>>,
-    chunker: Option<Box<dyn Chunker>>,
-    #[allow(dead_code)] // Reserved for future dynamic configuration
+    indexing_mode: IndexingMode,
+    #[allow(dead_code)]
     chunk_config: ChunkConfig,
 }
 
@@ -254,6 +383,12 @@ impl DocumentService {
         chunker: Option<Box<dyn Chunker>>,
         chunk_store: Option<Box<dyn ChunkStore>>,
     ) -> Result<Self, AppError> {
+        // Convert tombstone config to policy (validates and rejects conflicting settings)
+        let tombstone_policy = config
+            .tombstone_config
+            .into_policy()
+            .map_err(|e| AppError::Io(e.to_string()))?;
+
         // Validate: chunk_store and chunker must be provided together
         match (&chunker, &chunk_store) {
             (Some(_), None) => {
@@ -380,8 +515,19 @@ impl DocumentService {
             }
         }
 
-        // Build chunk mapping (includes ALL chunks to maintain index alignment)
-        let chunk_mapping = build_chunk_mapping(&chunks, &records);
+        // Build indexing mode based on chunker/chunk_store availability
+        let indexing_mode = match (chunker, chunk_store) {
+            (Some(chunker), Some(chunk_store)) => {
+                let chunk_mapping = build_chunk_mapping(&chunks, &records);
+                IndexingMode::Chunked {
+                    chunker,
+                    chunk_store,
+                    chunks,
+                    chunk_mapping,
+                }
+            }
+            _ => IndexingMode::Direct,
+        };
 
         // After successful load, save snapshot and truncate WAL
         let mut service = Self {
@@ -395,13 +541,10 @@ impl DocumentService {
             default_ef: config.default_ef,
             wal,
             wal_config: config.wal_config,
-            tombstone_config: config.tombstone_config,
+            tombstone_policy,
             tombstone_count,
             bm25_index,
-            chunks,
-            chunk_mapping,
-            chunk_store,
-            chunker,
+            indexing_mode,
             chunk_config: config.chunk_config,
         };
 
@@ -425,9 +568,14 @@ impl DocumentService {
 
     /// Migrate existing records to chunking mode by re-chunking all documents
     fn migrate_to_chunking(&mut self) -> Result<(), AppError> {
-        let chunker = match &self.chunker {
-            Some(c) => c,
-            None => return Ok(()), // No chunker, nothing to do
+        let IndexingMode::Chunked {
+            chunker,
+            chunk_store,
+            chunks,
+            chunk_mapping,
+        } = &mut self.indexing_mode
+        else {
+            return Ok(()); // Direct mode, nothing to do
         };
 
         println!(
@@ -493,25 +641,23 @@ impl DocumentService {
                 self.index.insert(embedding);
 
                 // Update chunk mapping
-                self.chunk_mapping.push((record_idx, chunk.chunk_index));
+                chunk_mapping.push((record_idx, chunk.chunk_index));
 
                 // Store chunk
-                self.chunks.push(stored_chunk);
+                chunks.push(stored_chunk);
             }
         }
 
         // Save everything
         self.index.save(&self.snapshot_path)?;
-        if let Some(ref cs) = self.chunk_store {
-            cs.save_all(&self.chunks)?;
-        }
+        chunk_store.save_all(chunks)?;
 
         // Truncate WAL since we have a fresh state
         if let Some(ref mut wal) = self.wal {
             wal.truncate()?;
         }
 
-        println!("Migration complete: {} chunks created", self.chunks.len());
+        println!("Migration complete: {} chunks created", chunks.len());
         Ok(())
     }
 
@@ -531,95 +677,100 @@ impl DocumentService {
         let text = build_text(cmd.text.as_deref(), &cmd.record)
             .ok_or_else(|| AppError::BadRequest("text/title/body is required".to_string()))?;
 
-        // Check if chunking is enabled
-        if let Some(ref chunker) = self.chunker {
-            // Chunking mode: split text into chunks and index each chunk
-            let text_chunks = chunker.chunk(&text);
-            if text_chunks.is_empty() {
-                return Err(AppError::BadRequest("text produced no chunks".to_string()));
-            }
-
-            // Get embeddings for all chunks
-            let chunk_texts: Vec<String> = text_chunks.iter().map(|c| c.text.clone()).collect();
-            let embeddings = self.embedder.embed(chunk_texts)?;
-
-            // Store the document record with the first chunk's embedding (for compatibility)
-            let doc_embedding = embeddings.first().cloned().unwrap_or_default();
-            let stored = StoredRecord::new(cmd.record.clone(), doc_embedding.clone());
-
-            // Write to WAL first
-            if let Some(ref mut wal) = self.wal {
-                wal.append_insert(&stored)?;
-            }
-
-            // Add record to records list (but don't add to vector index - chunks go there)
-            let record_idx = self.records.len();
-            self.records.push(stored.clone());
-
-            // Create and store chunks, add to vector index
-            let mut first_index_id = None;
-            for (chunk, embedding) in text_chunks.into_iter().zip(embeddings.into_iter()) {
-                let stored_chunk =
-                    StoredChunk::new(cmd.record.id.clone(), chunk.clone(), embedding.clone());
-
-                // Add chunk embedding to vector index
-                let chunk_index_id = self.index.insert(embedding);
-                if first_index_id.is_none() {
-                    first_index_id = Some(chunk_index_id);
+        match &mut self.indexing_mode {
+            IndexingMode::Chunked {
+                chunker,
+                chunk_store,
+                chunks,
+                chunk_mapping,
+            } => {
+                // Chunking mode: split text into chunks and index each chunk
+                let text_chunks = chunker.chunk(&text);
+                if text_chunks.is_empty() {
+                    return Err(AppError::BadRequest("text produced no chunks".to_string()));
                 }
 
-                // Update chunk mapping
-                self.chunk_mapping.push((record_idx, chunk.chunk_index));
+                // Get embeddings for all chunks
+                let chunk_texts: Vec<String> = text_chunks.iter().map(|c| c.text.clone()).collect();
+                let embeddings = self.embedder.embed(chunk_texts)?;
 
-                // Store chunk
-                self.chunks.push(stored_chunk.clone());
-                if let Some(ref cs) = self.chunk_store {
-                    cs.append(&stored_chunk)?;
+                // Store the document record with the first chunk's embedding (for compatibility)
+                let doc_embedding = embeddings.first().cloned().unwrap_or_default();
+                let stored = StoredRecord::new(cmd.record.clone(), doc_embedding.clone());
+
+                // Write to WAL first
+                if let Some(ref mut wal) = self.wal {
+                    wal.append_insert(&stored)?;
                 }
+
+                // Add record to records list (but don't add to vector index - chunks go there)
+                let record_idx = self.records.len();
+                self.records.push(stored.clone());
+
+                // Create and store chunks, add to vector index
+                let mut first_index_id = None;
+                for (chunk, embedding) in text_chunks.into_iter().zip(embeddings.into_iter()) {
+                    let stored_chunk =
+                        StoredChunk::new(cmd.record.id.clone(), chunk.clone(), embedding.clone());
+
+                    // Add chunk embedding to vector index
+                    let chunk_index_id = self.index.insert(embedding);
+                    if first_index_id.is_none() {
+                        first_index_id = Some(chunk_index_id);
+                    }
+
+                    // Update chunk mapping
+                    chunk_mapping.push((record_idx, chunk.chunk_index));
+
+                    // Store chunk
+                    chunks.push(stored_chunk.clone());
+                    chunk_store.append(&stored_chunk)?;
+                }
+
+                // Update BM25 index with full document text (not chunks)
+                self.bm25_index.add(record_idx, &text);
+
+                self.index.save(&self.snapshot_path)?;
+                self.record_store.append(&stored)?;
+
+                // Check if WAL rotation is needed
+                self.maybe_rotate_wal()?;
+
+                Ok(InsertResult {
+                    index_id: first_index_id.unwrap_or(0),
+                    id: cmd.record.id,
+                    dim: doc_embedding.len(),
+                })
             }
+            IndexingMode::Direct => {
+                // Non-chunking mode: original behavior
+                let embedding = self.embed_single(text.clone())?;
+                let stored = StoredRecord::new(cmd.record.clone(), embedding.clone());
 
-            // Update BM25 index with full document text (not chunks)
-            self.bm25_index.add(record_idx, &text);
+                // Write to WAL first
+                if let Some(ref mut wal) = self.wal {
+                    wal.append_insert(&stored)?;
+                }
 
-            self.index.save(&self.snapshot_path)?;
-            self.record_store.append(&stored)?;
+                // Then update index and records
+                let index_id = self.index.insert(embedding.clone());
+                self.records.push(stored.clone());
 
-            // Check if WAL rotation is needed
-            self.maybe_rotate_wal()?;
+                // Update BM25 index
+                self.bm25_index.add(index_id, &text);
 
-            Ok(InsertResult {
-                index_id: first_index_id.unwrap_or(0),
-                id: cmd.record.id,
-                dim: doc_embedding.len(),
-            })
-        } else {
-            // Non-chunking mode: original behavior
-            let embedding = self.embed_single(text.clone())?;
-            let stored = StoredRecord::new(cmd.record.clone(), embedding.clone());
+                self.index.save(&self.snapshot_path)?;
+                self.record_store.append(&stored)?;
 
-            // Write to WAL first
-            if let Some(ref mut wal) = self.wal {
-                wal.append_insert(&stored)?;
+                // Check if WAL rotation is needed
+                self.maybe_rotate_wal()?;
+
+                Ok(InsertResult {
+                    index_id,
+                    id: cmd.record.id,
+                    dim: embedding.len(),
+                })
             }
-
-            // Then update index and records
-            let index_id = self.index.insert(embedding.clone());
-            self.records.push(stored.clone());
-
-            // Update BM25 index
-            self.bm25_index.add(index_id, &text);
-
-            self.index.save(&self.snapshot_path)?;
-            self.record_store.append(&stored)?;
-
-            // Check if WAL rotation is needed
-            self.maybe_rotate_wal()?;
-
-            Ok(InsertResult {
-                index_id,
-                id: cmd.record.id,
-                dim: embedding.len(),
-            })
         }
     }
 
@@ -627,7 +778,8 @@ impl DocumentService {
         let index_id = self.find_index(id)?;
         let current = self.records[index_id].clone();
 
-        let needs_embedding = cmd.text.is_some() || cmd.title.is_some() || cmd.body.is_some();
+        // Determine if content changed (requires re-embedding) or only metadata changed
+        let content_changed = cmd.text.is_some() || cmd.title.is_some() || cmd.body.is_some();
         let updated = Record {
             id: current.record.id.clone(),
             title: cmd.title.or(current.record.title),
@@ -637,8 +789,8 @@ impl DocumentService {
             tags: cmd.tags.or(current.record.tags),
         };
 
-        // Get text for embedding if needed
-        let text_for_embedding = if needs_embedding {
+        // Determine update effect
+        let effect = if content_changed {
             let text = cmd
                 .text
                 .or_else(|| build_text(None, &updated))
@@ -646,166 +798,177 @@ impl DocumentService {
             if text.trim().is_empty() {
                 return Err(AppError::BadRequest("text must not be empty".to_string()));
             }
-            Some(text)
+            UpdateEffect::ContentChanged { text }
         } else {
-            None
+            UpdateEffect::MetadataOnly
         };
 
-        if let Some(text) = text_for_embedding {
-            // Embedding changed: tombstone old record/chunks, append new
+        match effect {
+            UpdateEffect::ContentChanged { text } => {
+                // Embedding changed: tombstone old record/chunks, append new
 
-            // Check if chunking is enabled
-            if let Some(ref chunker) = self.chunker {
-                // Chunking mode: re-chunk and re-index
+                match &mut self.indexing_mode {
+                    IndexingMode::Chunked {
+                        chunker,
+                        chunk_store,
+                        chunks,
+                        chunk_mapping,
+                    } => {
+                        // Chunking mode: re-chunk and re-index
 
-                // Mark old record as deleted
-                self.records[index_id].deleted = true;
-                self.tombstone_count += 1;
+                        // Mark old record as deleted
+                        self.records[index_id].deleted = true;
+                        self.tombstone_count += 1;
 
-                // Mark all old chunks for this document as deleted
-                for chunk in &mut self.chunks {
-                    if chunk.parent_id == id {
-                        chunk.deleted = true;
+                        // Mark all old chunks for this document as deleted
+                        for chunk in chunks.iter_mut() {
+                            if chunk.parent_id == id {
+                                chunk.deleted = true;
+                            }
+                        }
+
+                        // Update BM25: remove old
+                        self.bm25_index.remove(index_id);
+
+                        // Generate new chunks
+                        let text_chunks = chunker.chunk(&text);
+                        if text_chunks.is_empty() {
+                            return Err(AppError::BadRequest(
+                                "text produced no chunks".to_string(),
+                            ));
+                        }
+
+                        // Get embeddings for all new chunks
+                        let chunk_texts: Vec<String> =
+                            text_chunks.iter().map(|c| c.text.clone()).collect();
+                        let embeddings = self.embedder.embed(chunk_texts)?;
+
+                        // Create new record
+                        let doc_embedding = embeddings.first().cloned().unwrap_or_default();
+                        let new_stored = StoredRecord::new(updated.clone(), doc_embedding.clone());
+
+                        // Write to WAL
+                        if let Some(ref mut wal) = self.wal {
+                            wal.append_delete(&current.record.id)?;
+                            wal.append_append(&new_stored)?;
+                        }
+
+                        // Add new record
+                        let new_record_idx = self.records.len();
+                        self.records.push(new_stored.clone());
+
+                        // Create and store new chunks, add to vector index
+                        let mut first_index_id = None;
+                        for (chunk, emb) in text_chunks.into_iter().zip(embeddings.into_iter()) {
+                            let stored_chunk =
+                                StoredChunk::new(updated.id.clone(), chunk.clone(), emb.clone());
+
+                            // Add chunk embedding to vector index
+                            let chunk_index_id = self.index.insert(emb);
+                            if first_index_id.is_none() {
+                                first_index_id = Some(chunk_index_id);
+                            }
+
+                            // Update chunk mapping
+                            chunk_mapping.push((new_record_idx, chunk.chunk_index));
+
+                            // Store chunk
+                            chunks.push(stored_chunk);
+                        }
+
+                        // Add to BM25 index
+                        self.bm25_index.add(new_record_idx, &text);
+
+                        // Save state
+                        self.index.save(&self.snapshot_path)?;
+                        self.record_store.save_all(&self.records)?;
+                        chunk_store.save_all(chunks)?;
+
+                        // Check if compaction is needed
+                        self.maybe_compact()?;
+
+                        // Check if WAL rotation is needed
+                        self.maybe_rotate_wal()?;
+
+                        Ok(DocumentResponse {
+                            index_id: first_index_id.unwrap_or(0),
+                            record: updated,
+                            embedding: doc_embedding,
+                        })
+                    }
+                    IndexingMode::Direct => {
+                        // Non-chunking mode: original behavior
+                        let embedding = self.embed_single(text)?;
+                        let new_stored = StoredRecord::new(updated.clone(), embedding.clone());
+
+                        // Write to WAL first: DELETE old, then APPEND new (idempotent replay)
+                        if let Some(ref mut wal) = self.wal {
+                            wal.append_delete(&current.record.id)?;
+                            wal.append_append(&new_stored)?;
+                        }
+
+                        // Mark old record as deleted (tombstone)
+                        self.records[index_id].deleted = true;
+                        self.tombstone_count += 1;
+
+                        // Update BM25: remove old, add new
+                        self.bm25_index.remove(index_id);
+
+                        // Append new record and add to index
+                        let new_index_id = self.index.insert(embedding.clone());
+                        self.records.push(new_stored.clone());
+
+                        // Add to BM25 index
+                        if let Some(bm25_text) = build_text(None, &updated) {
+                            self.bm25_index.add(new_index_id, &bm25_text);
+                        }
+
+                        // Save state
+                        self.index.save(&self.snapshot_path)?;
+                        self.record_store.save_all(&self.records)?;
+
+                        // Check if compaction is needed
+                        self.maybe_compact()?;
+
+                        // Check if WAL rotation is needed
+                        self.maybe_rotate_wal()?;
+
+                        Ok(DocumentResponse {
+                            index_id: new_index_id,
+                            record: updated,
+                            embedding,
+                        })
                     }
                 }
+            }
+            UpdateEffect::MetadataOnly => {
+                // Only metadata changed: update in place (no index change needed)
+                let stored = StoredRecord::new(updated.clone(), current.embedding.clone());
 
-                // Update BM25: remove old
-                self.bm25_index.remove(index_id);
-
-                // Generate new chunks
-                let text_chunks = chunker.chunk(&text);
-                if text_chunks.is_empty() {
-                    return Err(AppError::BadRequest("text produced no chunks".to_string()));
-                }
-
-                // Get embeddings for all new chunks
-                let chunk_texts: Vec<String> = text_chunks.iter().map(|c| c.text.clone()).collect();
-                let embeddings = self.embedder.embed(chunk_texts)?;
-
-                // Create new record
-                let doc_embedding = embeddings.first().cloned().unwrap_or_default();
-                let new_stored = StoredRecord::new(updated.clone(), doc_embedding.clone());
-
-                // Write to WAL
+                // Write to WAL first
                 if let Some(ref mut wal) = self.wal {
-                    wal.append_delete(&current.record.id)?;
-                    wal.append_append(&new_stored)?;
+                    wal.append_update(&stored)?;
                 }
 
-                // Add new record
-                let new_record_idx = self.records.len();
-                self.records.push(new_stored.clone());
+                // Update record in place
+                self.records[index_id] = stored;
 
-                // Create and store new chunks, add to vector index
-                let mut first_index_id = None;
-                for (chunk, emb) in text_chunks.into_iter().zip(embeddings.into_iter()) {
-                    let stored_chunk =
-                        StoredChunk::new(updated.id.clone(), chunk.clone(), emb.clone());
-
-                    // Add chunk embedding to vector index
-                    let chunk_index_id = self.index.insert(emb);
-                    if first_index_id.is_none() {
-                        first_index_id = Some(chunk_index_id);
-                    }
-
-                    // Update chunk mapping
-                    self.chunk_mapping.push((new_record_idx, chunk.chunk_index));
-
-                    // Store chunk
-                    self.chunks.push(stored_chunk);
-                }
-
-                // Add to BM25 index
-                self.bm25_index.add(new_record_idx, &text);
-
-                // Save state
-                self.index.save(&self.snapshot_path)?;
-                self.record_store.save_all(&self.records)?;
-                if let Some(ref cs) = self.chunk_store {
-                    cs.save_all(&self.chunks)?;
-                }
-
-                // Check if compaction is needed
-                self.maybe_compact()?;
-
-                // Check if WAL rotation is needed
-                self.maybe_rotate_wal()?;
-
-                Ok(DocumentResponse {
-                    index_id: first_index_id.unwrap_or(0),
-                    record: updated,
-                    embedding: doc_embedding,
-                })
-            } else {
-                // Non-chunking mode: original behavior
-                let embedding = self.embed_single(text)?;
-                let new_stored = StoredRecord::new(updated.clone(), embedding.clone());
-
-                // Write to WAL first: DELETE old, then APPEND new (idempotent replay)
-                if let Some(ref mut wal) = self.wal {
-                    wal.append_delete(&current.record.id)?;
-                    wal.append_append(&new_stored)?;
-                }
-
-                // Mark old record as deleted (tombstone)
-                self.records[index_id].deleted = true;
-                self.tombstone_count += 1;
-
-                // Update BM25: remove old, add new
-                self.bm25_index.remove(index_id);
-
-                // Append new record and add to index
-                let new_index_id = self.index.insert(embedding.clone());
-                self.records.push(new_stored.clone());
-
-                // Add to BM25 index
+                // Update BM25 index
                 if let Some(bm25_text) = build_text(None, &updated) {
-                    self.bm25_index.add(new_index_id, &bm25_text);
+                    self.bm25_index.update(index_id, &bm25_text);
                 }
 
-                // Save state
-                self.index.save(&self.snapshot_path)?;
                 self.record_store.save_all(&self.records)?;
-
-                // Check if compaction is needed
-                self.maybe_compact()?;
 
                 // Check if WAL rotation is needed
                 self.maybe_rotate_wal()?;
 
                 Ok(DocumentResponse {
-                    index_id: new_index_id,
+                    index_id,
                     record: updated,
-                    embedding,
+                    embedding: self.records[index_id].embedding.clone(),
                 })
             }
-        } else {
-            // Only metadata changed: update in place (no index change needed)
-            let stored = StoredRecord::new(updated.clone(), current.embedding.clone());
-
-            // Write to WAL first
-            if let Some(ref mut wal) = self.wal {
-                wal.append_update(&stored)?;
-            }
-
-            // Update record in place
-            self.records[index_id] = stored;
-
-            // Update BM25 index
-            if let Some(text) = build_text(None, &updated) {
-                self.bm25_index.update(index_id, &text);
-            }
-
-            self.record_store.save_all(&self.records)?;
-
-            // Check if WAL rotation is needed
-            self.maybe_rotate_wal()?;
-
-            Ok(DocumentResponse {
-                index_id,
-                record: updated,
-                embedding: self.records[index_id].embedding.clone(),
-            })
         }
     }
 
@@ -824,17 +987,20 @@ impl DocumentService {
         // Remove from BM25 index
         self.bm25_index.remove(index_id);
 
-        // Mark all chunks for this document as deleted
-        if self.chunker.is_some() {
-            for chunk in &mut self.chunks {
+        // Mark all chunks for this document as deleted (if chunking enabled)
+        if let IndexingMode::Chunked {
+            chunks,
+            chunk_store,
+            ..
+        } = &mut self.indexing_mode
+        {
+            for chunk in chunks.iter_mut() {
                 if chunk.parent_id == id {
                     chunk.deleted = true;
                 }
             }
             // Save updated chunks
-            if let Some(ref cs) = self.chunk_store {
-                cs.save_all(&self.chunks)?;
-            }
+            chunk_store.save_all(chunks)?;
         }
 
         self.record_store.save_all(&self.records)?;
@@ -851,35 +1017,40 @@ impl DocumentService {
     pub fn search(&self, cmd: SearchCommand) -> Result<Vec<SearchHit>, AppError> {
         let k = cmd.k.unwrap_or(self.default_k);
         let ef = cmd.ef.unwrap_or(self.default_ef);
-        let alpha = cmd.alpha.unwrap_or(0.7).clamp(0.0, 1.0);
+
+        // Parse and validate alpha into SearchMode
+        let search_mode = SearchMode::from_alpha(cmd.alpha.unwrap_or(0.7))
+            .map_err(|e| AppError::BadRequest(e.to_string()))?;
 
         let query_text = cmd.text.clone();
 
-        // Validate parameters based on alpha
-        // alpha=0.0 (BM25-only): requires text, no embedding needed
-        // alpha=1.0 (vector-only): requires text or embedding
-        // 0 < alpha < 1 (hybrid): requires text or embedding
-        if alpha == 0.0 && query_text.is_none() {
-            return Err(AppError::BadRequest(
-                "alpha=0.0 (BM25-only) requires 'text' parameter".to_string(),
-            ));
-        }
-        if alpha > 0.0 && query_text.is_none() && cmd.embedding.is_none() {
-            return Err(AppError::BadRequest(
-                "text or embedding is required".to_string(),
-            ));
+        // Validate parameters based on search mode
+        match search_mode {
+            SearchMode::Bm25Only if query_text.is_none() => {
+                return Err(AppError::BadRequest(
+                    "alpha=0.0 (BM25-only) requires 'text' parameter".to_string(),
+                ));
+            }
+            SearchMode::VectorOnly | SearchMode::Hybrid { .. }
+                if query_text.is_none() && cmd.embedding.is_none() =>
+            {
+                return Err(AppError::BadRequest(
+                    "text or embedding is required".to_string(),
+                ));
+            }
+            _ => {}
         }
 
         let search_k = (k * 4).max(100);
         let search_ef = ef.max(search_k);
 
         // Check if chunking is enabled
-        let chunking_enabled = self.chunker.is_some() && !self.chunk_mapping.is_empty();
+        let chunking_enabled = self.indexing_mode.is_chunked_with_data();
 
-        // Get vector search results (skip if alpha=0.0, BM25-only)
+        // Get vector search results (skip if BM25-only)
         // When chunking is enabled, this returns chunk-level results that need to be aggregated
         let (vector_scores, chunk_info_map): (HashMap<usize, f32>, HashMap<usize, (usize, f32)>) =
-            if alpha == 0.0 {
+            if !search_mode.needs_vector() {
                 (HashMap::new(), HashMap::new())
             } else {
                 let embedding = if let Some(embedding) = cmd.embedding.clone() {
@@ -899,16 +1070,18 @@ impl DocumentService {
                     // chunk_mapping[index_id] = (record_idx, chunk_idx)
                     let mut parent_scores: HashMap<usize, f32> = HashMap::new();
                     let mut parent_best_chunk: HashMap<usize, (usize, f32)> = HashMap::new();
+                    let chunks = self.indexing_mode.chunks();
+                    let chunk_mapping = self.indexing_mode.chunk_mapping();
 
                     for result in vector_results {
                         // Check if the chunk itself is deleted
-                        if let Some(chunk) = self.chunks.get(result.id) {
+                        if let Some(chunk) = chunks.get(result.id) {
                             if chunk.deleted {
                                 continue;
                             }
                         }
 
-                        if let Some(&(record_idx, chunk_idx)) = self.chunk_mapping.get(result.id) {
+                        if let Some(&(record_idx, chunk_idx)) = chunk_mapping.get(result.id) {
                             // Skip invalid mappings (usize::MAX sentinel)
                             if record_idx == usize::MAX {
                                 continue;
@@ -947,30 +1120,25 @@ impl DocumentService {
             };
 
         // Get BM25 results (document-level, not chunk-level)
-        let bm25_scores: HashMap<usize, f64> = if let Some(ref text) = query_text {
-            self.bm25_index
+        let bm25_scores: HashMap<usize, f64> = match (&query_text, search_mode.needs_bm25()) {
+            (Some(text), true) => self
+                .bm25_index
                 .search(text, search_k)
                 .into_iter()
-                .filter(|(id, _)| self.records.get(*id).map(|r| !r.deleted).unwrap_or(false))
-                .collect()
-        } else {
-            HashMap::new()
+                .filter(|(id, _)| self.records.get(*id).is_some_and(|r| !r.deleted))
+                .collect(),
+            _ => HashMap::new(),
         };
 
-        // Combine candidates based on alpha:
-        // alpha == 1.0 → vector only
-        // alpha == 0.0 → BM25 only
-        // otherwise   → union of both
-        let all_candidates: HashSet<usize> = if alpha == 1.0 {
-            vector_scores.keys().copied().collect()
-        } else if alpha == 0.0 {
-            bm25_scores.keys().copied().collect()
-        } else {
-            vector_scores
+        // Combine candidates based on search mode
+        let all_candidates: HashSet<usize> = match search_mode {
+            SearchMode::VectorOnly => vector_scores.keys().copied().collect(),
+            SearchMode::Bm25Only => bm25_scores.keys().copied().collect(),
+            SearchMode::Hybrid { .. } => vector_scores
                 .keys()
                 .chain(bm25_scores.keys())
                 .copied()
-                .collect()
+                .collect(),
         };
 
         // Normalize scores and compute hybrid score
@@ -1019,6 +1187,7 @@ impl DocumentService {
                 };
 
                 // Hybrid score: alpha * vector + (1 - alpha) * bm25
+                let alpha = search_mode.alpha();
                 let hybrid_score = alpha * vector_score + (1.0 - alpha) * bm25_score;
 
                 // Build best_chunk info if chunking is enabled
@@ -1026,7 +1195,8 @@ impl DocumentService {
                     chunk_info_map.get(&record_idx).map(|&(chunk_idx, _)| {
                         // Find the chunk text for preview
                         let text_preview = self
-                            .chunks
+                            .indexing_mode
+                            .chunks()
                             .iter()
                             .find(|c| {
                                 c.parent_id == record.record.id && c.chunk.chunk_index == chunk_idx
@@ -1191,41 +1361,31 @@ impl DocumentService {
         self.tombstone_count = 0;
 
         // Handle chunking mode vs non-chunking mode
-        if self.chunker.is_some() && !self.chunks.is_empty() {
-            // Chunking mode: rebuild from chunks
-            self.chunks.retain(|c| !c.deleted);
+        match &mut self.indexing_mode {
+            IndexingMode::Chunked {
+                chunks,
+                chunk_store,
+                chunk_mapping,
+                ..
+            } if !chunks.is_empty() => {
+                // Chunking mode: rebuild from chunks
+                chunks.retain(|c| !c.deleted);
 
-            // Create fake StoredRecords from chunks for index rebuilding
-            let chunk_records: Vec<StoredRecord> = self
-                .chunks
-                .iter()
-                .map(|c| {
-                    StoredRecord::new(
-                        Record {
-                            id: format!("{}_{}", c.parent_id, c.chunk.chunk_index),
-                            title: None,
-                            body: None,
-                            source: None,
-                            updated_at: None,
-                            tags: None,
-                        },
-                        c.embedding.clone(),
-                    )
-                })
-                .collect();
+                // Create fake StoredRecords from chunks for index rebuilding
+                let chunk_records = chunks_to_fake_records(chunks);
 
-            self.index = self.index_factory.rebuild(&chunk_records);
+                self.index = self.index_factory.rebuild(&chunk_records);
 
-            // Rebuild chunk_mapping
-            self.chunk_mapping = build_chunk_mapping(&self.chunks, &self.records);
+                // Rebuild chunk_mapping
+                *chunk_mapping = build_chunk_mapping(chunks, &self.records);
 
-            // Save chunks
-            if let Some(ref cs) = self.chunk_store {
-                cs.save_all(&self.chunks)?;
+                // Save chunks
+                chunk_store.save_all(chunks)?;
             }
-        } else {
-            // Non-chunking mode: rebuild from records
-            self.index = self.index_factory.rebuild(&self.records);
+            _ => {
+                // Non-chunking mode or empty chunks: rebuild from records
+                self.index = self.index_factory.rebuild(&self.records);
+            }
         }
 
         // Rebuild BM25 index (always document-level)
@@ -1253,13 +1413,13 @@ impl DocumentService {
             return Ok(());
         }
 
-        let should_compact = if let Some(max_tombstones) = self.tombstone_config.max_tombstones {
-            self.tombstone_count >= max_tombstones
-        } else if let Some(max_ratio) = self.tombstone_config.max_tombstone_ratio {
-            let ratio = self.tombstone_count as f64 / total as f64;
-            ratio >= max_ratio
-        } else {
-            false
+        let should_compact = match self.tombstone_policy {
+            TombstonePolicy::Disabled => false,
+            TombstonePolicy::MaxCount(max) => self.tombstone_count >= max,
+            TombstonePolicy::MaxRatio(max_ratio) => {
+                let ratio = self.tombstone_count as f64 / total as f64;
+                ratio >= max_ratio
+            }
         };
 
         if should_compact {
@@ -1930,11 +2090,11 @@ mod integration_tests {
 
         // Verify migration happened
         assert!(
-            !service.chunks.is_empty(),
+            !service.indexing_mode.chunks().is_empty(),
             "Chunks should have been created during migration"
         );
         assert!(
-            !service.chunk_mapping.is_empty(),
+            !service.indexing_mode.chunk_mapping().is_empty(),
             "Chunk mapping should have been created"
         );
 
@@ -1997,14 +2157,14 @@ mod integration_tests {
 
         // Verify chunks were created
         assert!(
-            !service.chunks.is_empty(),
+            !service.indexing_mode.chunks().is_empty(),
             "Chunks should have been created"
         );
 
         // Verify chunk_mapping aligns with index
         assert_eq!(
-            service.chunk_mapping.len(),
-            service.chunks.len(),
+            service.indexing_mode.chunk_mapping().len(),
+            service.indexing_mode.chunks().len(),
             "Chunk mapping should match chunks count"
         );
 
@@ -2070,14 +2230,16 @@ mod integration_tests {
         }
 
         // Verify alignment: chunk_mapping.len() == chunks.len() == index.len()
+        let chunks = service.indexing_mode.chunks();
+        let chunk_mapping = service.indexing_mode.chunk_mapping();
         assert_eq!(
-            service.chunk_mapping.len(),
-            service.chunks.len(),
+            chunk_mapping.len(),
+            chunks.len(),
             "Chunk mapping should equal chunks count"
         );
 
         // Each mapping should point to valid record and chunk
-        for (idx, &(record_idx, chunk_idx)) in service.chunk_mapping.iter().enumerate() {
+        for (idx, &(record_idx, chunk_idx)) in chunk_mapping.iter().enumerate() {
             assert!(
                 record_idx < service.records.len(),
                 "Record index {} out of bounds at mapping {}",
@@ -2085,7 +2247,7 @@ mod integration_tests {
                 idx
             );
             // Find corresponding chunk
-            let chunk = &service.chunks[idx];
+            let chunk = &chunks[idx];
             assert_eq!(
                 chunk.chunk.chunk_index, chunk_idx,
                 "Chunk index mismatch at mapping {}",
@@ -2133,7 +2295,12 @@ mod integration_tests {
             })
             .expect("Insert failed");
 
-        let chunks_before_delete: Vec<_> = service.chunks.iter().filter(|c| !c.deleted).collect();
+        let chunks_before_delete: Vec<_> = service
+            .indexing_mode
+            .chunks()
+            .iter()
+            .filter(|c| !c.deleted)
+            .collect();
         assert!(!chunks_before_delete.is_empty());
 
         // Delete the document
@@ -2141,7 +2308,8 @@ mod integration_tests {
 
         // Verify all chunks for doc1 are marked as deleted
         let active_chunks_for_doc1: Vec<_> = service
-            .chunks
+            .indexing_mode
+            .chunks()
             .iter()
             .filter(|c| c.parent_id == "doc1" && !c.deleted)
             .collect();
@@ -2206,7 +2374,7 @@ mod integration_tests {
             })
             .expect("Insert failed");
 
-        let chunks_before = service.chunks.len();
+        let chunks_before = service.indexing_mode.chunks().len();
 
         // Update the document with new body
         service
@@ -2224,12 +2392,17 @@ mod integration_tests {
             .expect("Update failed");
 
         // Verify old chunks are deleted and new ones created
-        let active_chunks: Vec<_> = service.chunks.iter().filter(|c| !c.deleted).collect();
+        let active_chunks: Vec<_> = service
+            .indexing_mode
+            .chunks()
+            .iter()
+            .filter(|c| !c.deleted)
+            .collect();
         assert!(!active_chunks.is_empty(), "Should have new active chunks");
 
         // Total chunks should be more (old deleted + new active)
         assert!(
-            service.chunks.len() >= chunks_before,
+            service.indexing_mode.chunks().len() >= chunks_before,
             "Total chunks should include both old (deleted) and new"
         );
     }
