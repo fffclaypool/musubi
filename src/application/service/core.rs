@@ -30,6 +30,16 @@ pub struct DocumentService {
 }
 
 impl DocumentService {
+    /// Get the default number of results (k) for search.
+    pub fn default_k(&self) -> usize {
+        self.default_k
+    }
+
+    /// Get the default search expansion factor (ef) for search.
+    pub fn default_ef(&self) -> usize {
+        self.default_ef
+    }
+
     /// Find the index of a record by ID.
     pub(super) fn find_index(&self, id: &str) -> Result<usize, AppError> {
         self.records

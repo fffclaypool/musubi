@@ -243,17 +243,164 @@ pub fn parse_tags(tags: Option<&str>) -> HashSet<String> {
     .unwrap_or_default()
 }
 
+/// Search input - validated query content
 #[derive(Debug, Clone)]
-pub struct SearchCommand {
+pub enum SearchInput {
+    /// Text query only - will be embedded by the service
+    Text(String),
+    /// Pre-computed embedding only
+    Embedding(Vec<f32>),
+    /// Both text and embedding provided
+    TextAndEmbedding { text: String, embedding: Vec<f32> },
+}
+
+impl SearchInput {
+    /// Get text if available
+    pub fn text(&self) -> Option<&str> {
+        match self {
+            Self::Text(t) | Self::TextAndEmbedding { text: t, .. } => Some(t),
+            Self::Embedding(_) => None,
+        }
+    }
+
+    /// Get embedding if available
+    pub fn embedding(&self) -> Option<&[f32]> {
+        match self {
+            Self::Embedding(e) | Self::TextAndEmbedding { embedding: e, .. } => Some(e),
+            Self::Text(_) => None,
+        }
+    }
+}
+
+/// Validated search parameters
+#[derive(Debug, Clone)]
+pub struct SearchParams {
+    /// Number of results to return
+    pub k: usize,
+    /// Search expansion factor for HNSW
+    pub ef: usize,
+    /// Search mode (vector-only, BM25-only, or hybrid)
+    pub mode: SearchMode,
+}
+
+/// Validated search query - all validation done at construction time
+#[derive(Debug, Clone)]
+pub struct ValidatedSearchQuery {
+    /// The search input (text, embedding, or both)
+    pub input: SearchInput,
+    /// Search parameters
+    pub params: SearchParams,
+    /// Optional metadata filter
+    pub filter: Option<SearchFilter>,
+}
+
+/// Error type for search query validation
+#[derive(Debug, Clone)]
+pub enum SearchValidationError {
+    /// Alpha value is invalid
+    InvalidAlpha(&'static str),
+    /// BM25-only mode requires text
+    Bm25RequiresText,
+    /// Vector/hybrid mode requires text or embedding
+    VectorRequiresInput,
+    /// Text is empty after trimming
+    EmptyText,
+    /// Embedding vector is empty
+    EmptyEmbedding,
+}
+
+impl std::fmt::Display for SearchValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidAlpha(msg) => write!(f, "{}", msg),
+            Self::Bm25RequiresText => write!(f, "alpha=0.0 (BM25-only) requires 'text' parameter"),
+            Self::VectorRequiresInput => write!(f, "text or embedding is required"),
+            Self::EmptyText => write!(f, "text must not be empty"),
+            Self::EmptyEmbedding => write!(f, "embedding must not be empty"),
+        }
+    }
+}
+
+impl std::error::Error for SearchValidationError {}
+
+/// Raw search request - used for parsing before validation
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SearchRequest {
     pub text: Option<String>,
     pub embedding: Option<Vec<f32>>,
     pub k: Option<usize>,
     pub ef: Option<usize>,
-    /// Weight for vector score in hybrid search (0.0 = BM25 only, 1.0 = vector only)
-    /// Default is 0.7
     pub alpha: Option<f64>,
-    /// Optional filter to narrow down search results
     pub filter: Option<SearchFilter>,
+}
+
+impl ValidatedSearchQuery {
+    /// Validate and construct a search query from a raw request.
+    ///
+    /// # Arguments
+    /// * `req` - The raw search request
+    /// * `default_k` - Default number of results
+    /// * `default_ef` - Default search expansion factor
+    pub fn from_request(
+        req: SearchRequest,
+        default_k: usize,
+        default_ef: usize,
+    ) -> Result<Self, SearchValidationError> {
+        // Parse and validate search mode from alpha
+        let mode = SearchMode::from_alpha(req.alpha.unwrap_or(0.7))
+            .map_err(SearchValidationError::InvalidAlpha)?;
+
+        // Validate text: explicit empty string is an error
+        let text = match req.text {
+            Some(t) => {
+                let trimmed = t.trim();
+                if trimmed.is_empty() {
+                    return Err(SearchValidationError::EmptyText);
+                }
+                Some(trimmed.to_string())
+            }
+            None => None,
+        };
+
+        // Validate embedding: explicit empty vector is an error
+        let embedding = match req.embedding {
+            Some(e) if e.is_empty() => return Err(SearchValidationError::EmptyEmbedding),
+            other => other,
+        };
+
+        // Build SearchInput based on mode and available inputs
+        let input = match mode {
+            SearchMode::Bm25Only => {
+                // BM25-only requires text
+                match text {
+                    Some(t) => SearchInput::Text(t),
+                    None => return Err(SearchValidationError::Bm25RequiresText),
+                }
+            }
+            SearchMode::VectorOnly | SearchMode::Hybrid { .. } => {
+                // Vector/hybrid requires at least text or embedding
+                match (text, embedding) {
+                    (Some(t), Some(e)) => SearchInput::TextAndEmbedding {
+                        text: t,
+                        embedding: e,
+                    },
+                    (Some(t), None) => SearchInput::Text(t),
+                    (None, Some(e)) => SearchInput::Embedding(e),
+                    (None, None) => return Err(SearchValidationError::VectorRequiresInput),
+                }
+            }
+        };
+
+        Ok(Self {
+            input,
+            params: SearchParams {
+                k: req.k.unwrap_or(default_k),
+                ef: req.ef.unwrap_or(default_ef),
+                mode,
+            },
+            filter: req.filter,
+        })
+    }
 }
 
 /// Information about the best matching chunk within a document
