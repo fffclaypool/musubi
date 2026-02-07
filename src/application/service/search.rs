@@ -17,6 +17,12 @@ struct Normalization {
     max_distance: f32,
 }
 
+/// Scored candidate with index and score breakdown
+struct ScoredCandidate {
+    record_idx: usize,
+    score: ScoreBreakdown,
+}
+
 impl DocumentService {
     /// Search for documents matching the validated query.
     ///
@@ -174,7 +180,31 @@ impl DocumentService {
         chunking_enabled: bool,
         k: usize,
     ) -> Vec<SearchHit> {
-        // Collect all candidates based on search mode
+        // Phase 1: Collect candidates
+        let candidates = self.collect_candidates(&vector_scores, &bm25_scores, mode, filter);
+
+        // Phase 2: Score candidates
+        let normalization = self.compute_normalization(&vector_scores, &bm25_scores);
+        let scored = self.score_candidates(
+            candidates,
+            &vector_scores,
+            &bm25_scores,
+            mode,
+            &normalization,
+        );
+
+        // Phase 3: Build hits with metadata
+        self.build_hits(scored, chunk_info_map, chunking_enabled, k)
+    }
+
+    /// Phase 1: Collect candidate record indices based on mode and filter
+    fn collect_candidates(
+        &self,
+        vector_scores: &HashMap<usize, f32>,
+        bm25_scores: &HashMap<usize, f64>,
+        mode: SearchMode,
+        filter: Option<&super::types::SearchFilter>,
+    ) -> Vec<usize> {
         let all_candidates: HashSet<usize> = match mode {
             SearchMode::VectorOnly => vector_scores.keys().copied().collect(),
             SearchMode::Bm25Only => bm25_scores.keys().copied().collect(),
@@ -185,73 +215,92 @@ impl DocumentService {
                 .collect(),
         };
 
-        // Compute normalization factors for hybrid scoring
-        let normalization = self.compute_normalization(&vector_scores, &bm25_scores);
+        all_candidates
+            .into_iter()
+            .filter(|&record_idx| {
+                self.records
+                    .get(record_idx)
+                    .is_some_and(|r| !r.deleted && filter.map_or(true, |f| f.matches(&r.record)))
+            })
+            .collect()
+    }
 
-        let mut hits: Vec<SearchHit> = all_candidates
+    /// Phase 2: Compute scores for each candidate
+    fn score_candidates(
+        &self,
+        candidates: Vec<usize>,
+        vector_scores: &HashMap<usize, f32>,
+        bm25_scores: &HashMap<usize, f64>,
+        mode: SearchMode,
+        normalization: &Normalization,
+    ) -> Vec<ScoredCandidate> {
+        candidates
             .into_iter()
             .filter_map(|record_idx| {
-                let record = self.records.get(record_idx)?;
-                if record.deleted {
-                    return None;
-                }
-
-                // Apply metadata filter
-                if let Some(f) = filter {
-                    if !f.matches(&record.record) {
-                        return None;
-                    }
-                }
-
                 let distance = vector_scores.get(&record_idx).copied();
                 let bm25_raw = bm25_scores.get(&record_idx).copied();
+                let score = self.build_score_breakdown(mode, distance, bm25_raw, normalization)?;
+                Some(ScoredCandidate { record_idx, score })
+            })
+            .collect()
+    }
 
-                // Build ScoreBreakdown based on search mode
-                let score = self.build_score_breakdown(mode, distance, bm25_raw, &normalization)?;
+    /// Phase 3: Build final SearchHit results
+    fn build_hits(
+        &self,
+        mut scored: Vec<ScoredCandidate>,
+        chunk_info_map: HashMap<usize, (usize, f32)>,
+        chunking_enabled: bool,
+        k: usize,
+    ) -> Vec<SearchHit> {
+        // Sort by ranking score descending
+        scored.sort_by(|a, b| {
+            b.score
+                .ranking_score()
+                .partial_cmp(&a.score.ranking_score())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        scored.truncate(k);
 
-                // Build chunk info if chunking is enabled
+        scored
+            .into_iter()
+            .filter_map(|candidate| {
+                let record = self.records.get(candidate.record_idx)?;
+
                 let best_chunk = if chunking_enabled {
-                    chunk_info_map.get(&record_idx).map(|&(chunk_idx, _)| {
-                        let text_preview = self
-                            .indexing_mode
-                            .chunks()
-                            .iter()
-                            .find(|c| {
-                                c.parent_id == record.record.id && c.chunk.chunk_index == chunk_idx
-                            })
-                            .map(|c| create_text_preview(&c.chunk.text, 100));
+                    chunk_info_map
+                        .get(&candidate.record_idx)
+                        .map(|&(chunk_idx, _)| {
+                            let text_preview = self
+                                .indexing_mode
+                                .chunks()
+                                .iter()
+                                .find(|c| {
+                                    c.parent_id == record.record.id
+                                        && c.chunk.chunk_index == chunk_idx
+                                })
+                                .map(|c| create_text_preview(&c.chunk.text, 100));
 
-                        ChunkInfo {
-                            chunk_index: chunk_idx,
-                            text_preview,
-                        }
-                    })
+                            ChunkInfo {
+                                chunk_index: chunk_idx,
+                                text_preview,
+                            }
+                        })
                 } else {
                     None
                 };
 
                 Some(SearchHit {
-                    index_id: record_idx,
+                    index_id: candidate.record_idx,
                     id: record.record.id.clone(),
-                    score,
+                    score: candidate.score,
                     title: record.record.title.clone(),
                     source: record.record.source.clone(),
                     tags: record.record.tags.clone(),
                     best_chunk,
                 })
             })
-            .collect();
-
-        // Sort by ranking score descending and truncate
-        hits.sort_by(|a, b| {
-            b.score
-                .ranking_score()
-                .partial_cmp(&a.score.ranking_score())
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        hits.truncate(k);
-
-        hits
+            .collect()
     }
 
     /// Compute normalization factors for hybrid scoring

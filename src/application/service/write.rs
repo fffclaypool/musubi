@@ -137,7 +137,7 @@ impl DocumentService {
             body: cmd.body.or(current.record.body),
             source: cmd.source.or(current.record.source),
             updated_at: cmd.updated_at.or(current.record.updated_at),
-            tags: cmd.tags.or(current.record.tags),
+            tags: cmd.tags.unwrap_or(current.record.tags),
         };
 
         // Determine update effect

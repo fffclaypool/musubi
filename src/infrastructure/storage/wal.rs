@@ -5,10 +5,11 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
+const MAGIC_V4: &[u8; 8] = b"MUSUBIW4";
 const MAGIC_V3: &[u8; 8] = b"MUSUBIW3";
 const MAGIC_V2: &[u8; 8] = b"MUSUBIW2";
 const MAGIC_V1: &[u8; 8] = b"MUSUBIW1";
-const VERSION: u32 = 3;
+const VERSION: u32 = 4;
 
 const OP_INSERT: u8 = 1;
 const OP_UPDATE: u8 = 2;
@@ -43,20 +44,47 @@ pub enum WalOp {
     },
 }
 
+/// WAL rotation policy - determines when to rotate the WAL file
+#[derive(Debug, Clone, Default)]
+pub enum WalRotationPolicy {
+    /// Never rotate automatically
+    #[default]
+    Disabled,
+    /// Rotate when file size exceeds max_bytes
+    MaxBytes(u64),
+    /// Rotate when record count exceeds max_records
+    MaxRecords(usize),
+    /// Rotate when either condition is met
+    MaxBytesOrRecords { max_bytes: u64, max_records: usize },
+}
+
+impl WalRotationPolicy {
+    /// Check if rotation should occur based on current state
+    fn should_rotate(&self, file_size: u64, record_count: usize) -> bool {
+        match self {
+            Self::Disabled => false,
+            Self::MaxBytes(max) => file_size >= *max,
+            Self::MaxRecords(max) => record_count >= *max,
+            Self::MaxBytesOrRecords {
+                max_bytes,
+                max_records,
+            } => file_size >= *max_bytes || record_count >= *max_records,
+        }
+    }
+}
+
 /// Configuration for WAL
 #[derive(Debug, Clone)]
 pub struct WalConfig {
     pub path: PathBuf,
-    pub max_bytes: Option<u64>,
-    pub max_records: Option<usize>,
+    pub rotation: WalRotationPolicy,
 }
 
 impl Default for WalConfig {
     fn default() -> Self {
         Self {
             path: PathBuf::from("hnsw.wal"),
-            max_bytes: None,
-            max_records: None,
+            rotation: WalRotationPolicy::Disabled,
         }
     }
 }
@@ -77,12 +105,19 @@ impl WalWriter {
             let mut magic = [0u8; 8];
             reader.read_exact(&mut magic)?;
 
-            if &magic == MAGIC_V1 || &magic == MAGIC_V2 {
-                // V1/V2 WAL detected - cannot auto-migrate.
+            if &magic == MAGIC_V1 || &magic == MAGIC_V2 || &magic == MAGIC_V3 {
+                // V1/V2/V3 WAL detected - cannot auto-migrate.
                 // V1: only stored vectors without record metadata.
                 // V2: no deleted flag, format incompatible with v3.
+                // V3: tags stored as Option<String>, incompatible with v4 Vec<Tag> format.
                 // User must verify records.jsonl is complete and manually delete the WAL file.
-                let version_str = if &magic == MAGIC_V1 { "v1" } else { "v2" };
+                let version_str = if &magic == MAGIC_V1 {
+                    "v1"
+                } else if &magic == MAGIC_V2 {
+                    "v2"
+                } else {
+                    "v3"
+                };
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
@@ -91,12 +126,12 @@ impl WalWriter {
                         version_str, path
                     ),
                 ));
-            } else if &magic != MAGIC_V3 {
+            } else if &magic != MAGIC_V4 {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
                         "invalid wal magic: expected {:?}, got {:?}",
-                        MAGIC_V3, magic
+                        MAGIC_V4, magic
                     ),
                 ));
             }
@@ -116,7 +151,7 @@ impl WalWriter {
         let mut writer = BufWriter::new(file);
 
         if path.metadata()?.len() == 0 {
-            writer.write_all(MAGIC_V3)?;
+            writer.write_all(MAGIC_V4)?;
             write_u32(&mut writer, VERSION)?;
             writer.flush()?;
         }
@@ -194,17 +229,8 @@ impl WalWriter {
 
     /// Check if WAL should be rotated based on config
     pub fn should_rotate(&self, config: &WalConfig) -> io::Result<bool> {
-        if let Some(max_bytes) = config.max_bytes {
-            if self.file_size()? >= max_bytes {
-                return Ok(true);
-            }
-        }
-        if let Some(max_records) = config.max_records {
-            if self.record_count >= max_records {
-                return Ok(true);
-            }
-        }
-        Ok(false)
+        let file_size = self.file_size()?;
+        Ok(config.rotation.should_rotate(file_size, self.record_count))
     }
 
     /// Truncate the WAL file (after snapshot is saved)
@@ -219,7 +245,7 @@ impl WalWriter {
             .truncate(true)
             .open(&self.path)?;
         let mut writer = BufWriter::new(file);
-        writer.write_all(MAGIC_V3)?;
+        writer.write_all(MAGIC_V4)?;
         write_u32(&mut writer, VERSION)?;
         writer.flush()?;
         writer.get_ref().sync_data()?;
@@ -245,12 +271,19 @@ pub fn replay<P: AsRef<Path>>(path: P) -> io::Result<Vec<WalOp>> {
     let mut magic = [0u8; 8];
     reader.read_exact(&mut magic)?;
 
-    if &magic == MAGIC_V1 || &magic == MAGIC_V2 {
-        // V1/V2 WAL cannot be replayed.
+    if &magic == MAGIC_V1 || &magic == MAGIC_V2 || &magic == MAGIC_V3 {
+        // V1/V2/V3 WAL cannot be replayed.
         // V1: only stored vectors without record metadata.
         // V2: no deleted flag, format incompatible with v3.
+        // V3: tags stored as Option<String>, incompatible with v4 Vec<Tag> format.
         // User must verify data integrity and manually delete the WAL file.
-        let version_str = if &magic == MAGIC_V1 { "v1" } else { "v2" };
+        let version_str = if &magic == MAGIC_V1 {
+            "v1"
+        } else if &magic == MAGIC_V2 {
+            "v2"
+        } else {
+            "v3"
+        };
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
@@ -259,12 +292,12 @@ pub fn replay<P: AsRef<Path>>(path: P) -> io::Result<Vec<WalOp>> {
                 version_str, path
             ),
         ));
-    } else if &magic != MAGIC_V3 {
+    } else if &magic != MAGIC_V4 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
                 "invalid wal magic: expected {:?}, got {:?}",
-                MAGIC_V3, magic
+                MAGIC_V4, magic
             ),
         ));
     }
@@ -521,7 +554,7 @@ fn write_record<W: Write>(writer: &mut W, record: &Record) -> io::Result<()> {
     write_optional_string(writer, &record.body)?;
     write_optional_string(writer, &record.source)?;
     write_optional_string(writer, &record.updated_at)?;
-    write_optional_string(writer, &record.tags)
+    write_tags(writer, &record.tags)
 }
 
 fn read_record<R: Read>(reader: &mut R, id: String) -> io::Result<Record> {
@@ -529,7 +562,7 @@ fn read_record<R: Read>(reader: &mut R, id: String) -> io::Result<Record> {
     let body = read_optional_string(reader)?;
     let source = read_optional_string(reader)?;
     let updated_at = read_optional_string(reader)?;
-    let tags = read_optional_string(reader)?;
+    let tags = read_tags(reader)?;
     Ok(Record {
         id,
         title,
@@ -538,6 +571,24 @@ fn read_record<R: Read>(reader: &mut R, id: String) -> io::Result<Record> {
         updated_at,
         tags,
     })
+}
+
+fn write_tags<W: Write>(writer: &mut W, tags: &[crate::domain::model::Tag]) -> io::Result<()> {
+    write_u32(writer, tags.len() as u32)?;
+    for tag in tags {
+        write_string(writer, tag.as_str())?;
+    }
+    Ok(())
+}
+
+fn read_tags<R: Read>(reader: &mut R) -> io::Result<Vec<crate::domain::model::Tag>> {
+    let len = read_u32(reader)? as usize;
+    let mut tags = Vec::with_capacity(len);
+    for _ in 0..len {
+        let s = read_string(reader)?;
+        tags.push(crate::domain::model::Tag::new(s));
+    }
+    Ok(tags)
 }
 
 fn write_embedding<W: Write>(writer: &mut W, embedding: &[f32]) -> io::Result<()> {
@@ -588,6 +639,8 @@ mod tests {
 
     #[test]
     fn test_wal_insert_replay() {
+        use crate::domain::model::Tag;
+
         let wal_path = temp_path("wal_insert");
 
         let record = Record {
@@ -596,7 +649,7 @@ mod tests {
             body: Some("Body text".to_string()),
             source: None,
             updated_at: None,
-            tags: Some("tag1,tag2".to_string()),
+            tags: vec![Tag::new("tag1"), Tag::new("tag2")],
         };
         let stored = StoredRecord::new(record, vec![1.0, 0.0, 0.5]);
 
@@ -619,7 +672,9 @@ mod tests {
                 assert_eq!(id, "doc-1");
                 assert_eq!(record.title, Some("Title".to_string()));
                 assert_eq!(record.body, Some("Body text".to_string()));
-                assert_eq!(record.tags, Some("tag1,tag2".to_string()));
+                assert_eq!(record.tags.len(), 2);
+                assert_eq!(record.tags[0].as_str(), "tag1");
+                assert_eq!(record.tags[1].as_str(), "tag2");
                 assert_eq!(embedding, &vec![1.0, 0.0, 0.5]);
                 assert!(!deleted);
             }
@@ -640,7 +695,7 @@ mod tests {
                 body: None,
                 source: None,
                 updated_at: None,
-                tags: None,
+                tags: vec![],
             },
             vec![1.0, 0.0],
         );
@@ -652,7 +707,7 @@ mod tests {
                 body: Some("New body".to_string()),
                 source: None,
                 updated_at: None,
-                tags: None,
+                tags: vec![],
             },
             vec![0.5, 0.5],
         );
@@ -688,7 +743,7 @@ mod tests {
                     body: None,
                     source: None,
                     updated_at: None,
-                    tags: None,
+                    tags: vec![],
                 },
                 embedding: vec![1.0, 0.0],
                 deleted: false,
@@ -701,7 +756,7 @@ mod tests {
                     body: None,
                     source: None,
                     updated_at: None,
-                    tags: None,
+                    tags: vec![],
                 },
                 embedding: vec![0.0, 1.0],
                 deleted: false,
@@ -714,7 +769,7 @@ mod tests {
                     body: Some("New body".to_string()),
                     source: None,
                     updated_at: None,
-                    tags: None,
+                    tags: vec![],
                 },
                 embedding: vec![0.5, 0.5],
                 deleted: false,
@@ -750,7 +805,7 @@ mod tests {
                 body: None,
                 source: None,
                 updated_at: None,
-                tags: None,
+                tags: vec![],
             },
             vec![1.0, 0.0],
         );
@@ -781,7 +836,7 @@ mod tests {
                 body: None,
                 source: None,
                 updated_at: None,
-                tags: None,
+                tags: vec![],
             },
             vec![1.0, 0.0],
         );
@@ -793,7 +848,7 @@ mod tests {
                 body: None,
                 source: None,
                 updated_at: None,
-                tags: None,
+                tags: vec![],
             },
             vec![0.0, 1.0],
         );
@@ -837,7 +892,7 @@ mod tests {
                     body: None,
                     source: None,
                     updated_at: None,
-                    tags: None,
+                    tags: vec![],
                 },
                 vec![1.0, 0.0],
             ),
@@ -848,7 +903,7 @@ mod tests {
                     body: None,
                     source: None,
                     updated_at: None,
-                    tags: None,
+                    tags: vec![],
                 },
                 vec![0.0, 1.0],
             ),
@@ -866,7 +921,7 @@ mod tests {
                     body: Some("New body".to_string()),
                     source: None,
                     updated_at: None,
-                    tags: None,
+                    tags: vec![],
                 },
                 vec![0.5, 0.5],
             );
@@ -880,7 +935,7 @@ mod tests {
                     body: Some("Updated body".to_string()),
                     source: None,
                     updated_at: None,
-                    tags: None,
+                    tags: vec![],
                 },
                 vec![0.8, 0.2],
             );
@@ -944,7 +999,7 @@ mod tests {
                 body: None,
                 source: None,
                 updated_at: None,
-                tags: None,
+                tags: vec![],
             },
             vec![1.0, 0.0],
         );
@@ -957,15 +1012,13 @@ mod tests {
             // Test max_records threshold
             let config_records = WalConfig {
                 path: wal_path.clone(),
-                max_bytes: None,
-                max_records: Some(2),
+                rotation: WalRotationPolicy::MaxRecords(2),
             };
             assert!(wal.should_rotate(&config_records).unwrap());
 
             let config_records_high = WalConfig {
                 path: wal_path.clone(),
-                max_bytes: None,
-                max_records: Some(10),
+                rotation: WalRotationPolicy::MaxRecords(10),
             };
             assert!(!wal.should_rotate(&config_records_high).unwrap());
 
@@ -973,17 +1026,31 @@ mod tests {
             let file_size = wal.file_size().unwrap();
             let config_bytes = WalConfig {
                 path: wal_path.clone(),
-                max_bytes: Some(file_size),
-                max_records: None,
+                rotation: WalRotationPolicy::MaxBytes(file_size),
             };
             assert!(wal.should_rotate(&config_bytes).unwrap());
 
             let config_bytes_high = WalConfig {
                 path: wal_path.clone(),
-                max_bytes: Some(file_size + 1000),
-                max_records: None,
+                rotation: WalRotationPolicy::MaxBytes(file_size + 1000),
             };
             assert!(!wal.should_rotate(&config_bytes_high).unwrap());
+
+            // Test combined policy
+            let config_combined = WalConfig {
+                path: wal_path.clone(),
+                rotation: WalRotationPolicy::MaxBytesOrRecords {
+                    max_bytes: file_size + 1000,
+                    max_records: 2,
+                },
+            };
+            assert!(wal.should_rotate(&config_combined).unwrap()); // records hit
+
+            let config_disabled = WalConfig {
+                path: wal_path.clone(),
+                rotation: WalRotationPolicy::Disabled,
+            };
+            assert!(!wal.should_rotate(&config_disabled).unwrap());
         }
 
         std::fs::remove_file(&wal_path).ok();
@@ -1019,7 +1086,7 @@ mod tests {
                 body: None,
                 source: None,
                 updated_at: None,
-                tags: None,
+                tags: vec![],
             },
             vec![1.0, 0.0],
         )];
@@ -1089,6 +1156,33 @@ mod tests {
     }
 
     #[test]
+    fn test_wal_v3_detection() {
+        let wal_path = temp_path("wal_v3_detection");
+
+        // Write a v3 WAL file (Option<String> tags format)
+        {
+            let mut file = File::create(&wal_path).unwrap();
+            file.write_all(b"MUSUBIW3").unwrap(); // v3 magic
+            file.write_all(&3u32.to_le_bytes()).unwrap(); // version 3
+            file.flush().unwrap();
+        }
+
+        // replay should return an error for v3 WAL
+        let result = replay(&wal_path);
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        assert!(err.to_string().contains("WAL v3 detected"));
+
+        // WalWriter::new should also return an error for v3 WAL
+        let result = WalWriter::new(&wal_path);
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        assert!(err.to_string().contains("WAL v3 detected"));
+
+        std::fs::remove_file(&wal_path).ok();
+    }
+
+    #[test]
     fn test_apply_ops_upsert_semantics() {
         // Test that INSERT uses upsert (replaces if exists)
         let mut records = vec![StoredRecord::new(
@@ -1098,7 +1192,7 @@ mod tests {
                 body: None,
                 source: None,
                 updated_at: None,
-                tags: None,
+                tags: vec![],
             },
             vec![1.0, 0.0],
         )];
@@ -1111,7 +1205,7 @@ mod tests {
                 body: None,
                 source: None,
                 updated_at: None,
-                tags: None,
+                tags: vec![],
             },
             embedding: vec![0.5, 0.5],
             deleted: false,
@@ -1133,7 +1227,7 @@ mod tests {
                 body: None,
                 source: None,
                 updated_at: None,
-                tags: None,
+                tags: vec![],
             },
             embedding: vec![0.8, 0.2],
             deleted: false,
@@ -1158,7 +1252,7 @@ mod tests {
                 body: None,
                 source: None,
                 updated_at: None,
-                tags: None,
+                tags: vec![],
             },
             vec![1.0, 0.0],
         )];
@@ -1176,7 +1270,7 @@ mod tests {
                     body: None,
                     source: None,
                     updated_at: None,
-                    tags: None,
+                    tags: vec![],
                 },
                 embedding: vec![0.5, 0.5],
                 deleted: false,
@@ -1203,7 +1297,7 @@ mod tests {
                     body: None,
                     source: None,
                     updated_at: None,
-                    tags: None,
+                    tags: vec![],
                 },
                 vec![1.0, 0.0],
                 true, // Already tombstoned
@@ -1215,7 +1309,7 @@ mod tests {
                     body: None,
                     source: None,
                     updated_at: None,
-                    tags: None,
+                    tags: vec![],
                 },
                 vec![0.5, 0.5],
             ),
@@ -1234,7 +1328,7 @@ mod tests {
                     body: None,
                     source: None,
                     updated_at: None,
-                    tags: None,
+                    tags: vec![],
                 },
                 embedding: vec![0.5, 0.5],
                 deleted: false,

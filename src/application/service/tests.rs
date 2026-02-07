@@ -288,7 +288,7 @@ mod integration_tests {
                     body: Some("This is a long document that should be split into multiple chunks when chunking is enabled.".to_string()),
                     source: None,
                     updated_at: None,
-                    tags: None,
+                    tags: vec![],
                 },
                 vec![0.1; 8], // Pre-existing embedding (will be ignored in chunking mode)
             ),
@@ -299,7 +299,7 @@ mod integration_tests {
                     body: Some("Another document with some content.".to_string()),
                     source: None,
                     updated_at: None,
-                    tags: None,
+                    tags: vec![],
                 },
                 vec![0.2; 8],
             ),
@@ -386,7 +386,7 @@ mod integration_tests {
                     body: Some("This is a test document with enough text to be split into multiple chunks for testing purposes.".to_string()),
                     source: None,
                     updated_at: None,
-                    tags: None,
+                    tags: vec![],
                 },
                 text: None,
             })
@@ -463,7 +463,7 @@ mod integration_tests {
                         )),
                         source: None,
                         updated_at: None,
-                        tags: None,
+                        tags: vec![],
                     },
                     text: None,
                 })
@@ -530,7 +530,7 @@ mod integration_tests {
                     ),
                     source: None,
                     updated_at: None,
-                    tags: None,
+                    tags: vec![],
                 },
                 text: None,
             })
@@ -611,7 +611,7 @@ mod integration_tests {
                     body: Some("Original content that will be changed.".to_string()),
                     source: None,
                     updated_at: None,
-                    tags: None,
+                    tags: vec![],
                 },
                 text: None,
             })

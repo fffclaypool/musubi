@@ -1,7 +1,7 @@
 //! Application configuration loaded from environment variables.
 
 use crate::application::service::{ChunkConfig, ServiceConfig, TombstoneConfig};
-use crate::infrastructure::storage::wal::WalConfig;
+use crate::infrastructure::storage::wal::{WalConfig, WalRotationPolicy};
 use std::path::PathBuf;
 use std::{env, io};
 
@@ -126,11 +126,23 @@ impl AppConfig {
         match &self.wal_config {
             Some(wal) => {
                 println!("WAL enabled: {:?}", wal.path);
-                if let Some(max_bytes) = wal.max_bytes {
-                    println!("  max_bytes: {}", max_bytes);
-                }
-                if let Some(max_records) = wal.max_records {
-                    println!("  max_records: {}", max_records);
+                match &wal.rotation {
+                    WalRotationPolicy::Disabled => println!("  rotation: disabled"),
+                    WalRotationPolicy::MaxBytes(bytes) => {
+                        println!("  rotation: max_bytes = {}", bytes)
+                    }
+                    WalRotationPolicy::MaxRecords(records) => {
+                        println!("  rotation: max_records = {}", records)
+                    }
+                    WalRotationPolicy::MaxBytesOrRecords {
+                        max_bytes,
+                        max_records,
+                    } => {
+                        println!(
+                            "  rotation: max_bytes = {} OR max_records = {}",
+                            max_bytes, max_records
+                        )
+                    }
                 }
             }
             None => println!("WAL disabled"),
@@ -193,11 +205,17 @@ impl AppConfig {
             .ok()
             .and_then(|s| s.parse::<usize>().ok());
 
-        Some(WalConfig {
-            path,
-            max_bytes,
-            max_records,
-        })
+        let rotation = match (max_bytes, max_records) {
+            (Some(bytes), Some(records)) => WalRotationPolicy::MaxBytesOrRecords {
+                max_bytes: bytes,
+                max_records: records,
+            },
+            (Some(bytes), None) => WalRotationPolicy::MaxBytes(bytes),
+            (None, Some(records)) => WalRotationPolicy::MaxRecords(records),
+            (None, None) => WalRotationPolicy::Disabled,
+        };
+
+        Some(WalConfig { path, rotation })
     }
 
     fn parse_tombstone_config() -> Result<TombstoneConfig, ConfigError> {

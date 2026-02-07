@@ -1,7 +1,7 @@
 use crate::application::error::AppError;
 use crate::application::service::{
     DocumentResponse, DocumentService, DocumentSummary, InsertCommand, InsertResult, SearchHit,
-    SearchRequest, SearchValidationError, UpdateCommand, ValidatedSearchQuery,
+    SearchRequest, SearchValidationError, Tag, UpdateCommand, ValidatedSearchQuery,
 };
 use crate::domain::model::Record;
 use axum::{
@@ -28,7 +28,8 @@ struct InsertRequest {
     body: Option<String>,
     source: Option<String>,
     updated_at: Option<String>,
-    tags: Option<String>,
+    #[serde(default)]
+    tags: Vec<Tag>,
     text: Option<String>,
 }
 
@@ -38,7 +39,7 @@ struct UpdateRequest {
     body: Option<String>,
     source: Option<String>,
     updated_at: Option<String>,
-    tags: Option<String>,
+    tags: Option<Vec<Tag>>,
     text: Option<String>,
 }
 

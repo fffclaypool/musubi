@@ -1,4 +1,46 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+
+/// A normalized tag (lowercase, trimmed)
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[serde(transparent)]
+pub struct Tag(String);
+
+impl<'de> Deserialize<'de> for Tag {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        Ok(Tag::new(s))
+    }
+}
+
+impl Tag {
+    /// Create a new tag, normalizing to lowercase and trimmed
+    pub fn new(s: impl Into<String>) -> Self {
+        Self(s.into().trim().to_lowercase())
+    }
+
+    /// Get the tag value as a string slice
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Parse comma-separated tags into a Vec<Tag>
+    pub fn parse_many(tags: &str) -> Vec<Tag> {
+        tags.split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(Tag::new)
+            .collect()
+    }
+}
+
+impl std::fmt::Display for Tag {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
 
 /// A chunk of text extracted from a document
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -46,7 +88,9 @@ pub struct Record {
     pub body: Option<String>,
     pub source: Option<String>,
     pub updated_at: Option<String>,
-    pub tags: Option<String>,
+    /// Tags associated with this record (normalized to lowercase)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<Tag>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
