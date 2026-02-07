@@ -12,6 +12,9 @@ use musubi::interface::http::server::serve;
 use std::io;
 use std::sync::Arc;
 
+/// Optional chunker and chunk store pair for document chunking
+type ChunkerPair = (Option<Box<dyn Chunker>>, Option<Box<dyn ChunkStore>>);
+
 #[tokio::main]
 async fn main() -> io::Result<()> {
     let config = AppConfig::from_env().map_err(map_config_error)?;
@@ -26,30 +29,29 @@ async fn main() -> io::Result<()> {
     };
 
     // Create chunker and chunk store based on configuration
-    let (chunker, chunk_store): (Option<Box<dyn Chunker>>, Option<Box<dyn ChunkStore>>) =
-        match &config.chunk_config {
-            ChunkConfig::Fixed {
-                chunk_size,
-                overlap,
-            } => (
-                Some(Box::new(FixedChunker::new(*chunk_size, *overlap))),
-                Some(Box::new(JsonlChunkStore::new(&config.chunks_path))),
-            ),
-            ChunkConfig::Semantic {
-                min_chunk_size,
-                max_chunk_size,
-                similarity_threshold,
-            } => (
-                Some(Box::new(SemanticChunker::new(
-                    *min_chunk_size,
-                    *max_chunk_size,
-                    *similarity_threshold,
-                    embedder.clone(),
-                ))),
-                Some(Box::new(JsonlChunkStore::new(&config.chunks_path))),
-            ),
-            ChunkConfig::None => (None, None),
-        };
+    let (chunker, chunk_store): ChunkerPair = match &config.chunk_config {
+        ChunkConfig::Fixed {
+            chunk_size,
+            overlap,
+        } => (
+            Some(Box::new(FixedChunker::new(*chunk_size, *overlap))),
+            Some(Box::new(JsonlChunkStore::new(&config.chunks_path))),
+        ),
+        ChunkConfig::Semantic {
+            min_chunk_size,
+            max_chunk_size,
+            similarity_threshold,
+        } => (
+            Some(Box::new(SemanticChunker::new(
+                *min_chunk_size,
+                *max_chunk_size,
+                *similarity_threshold,
+                embedder.clone(),
+            ))),
+            Some(Box::new(JsonlChunkStore::new(&config.chunks_path))),
+        ),
+        ChunkConfig::None => (None, None),
+    };
 
     let service_config = config.service_config();
     let embedder_box: Box<dyn Embedder> = Box::new(ArcEmbedder(embedder));
@@ -79,7 +81,7 @@ impl Embedder for ArcEmbedder {
 }
 
 fn map_app_error(err: AppError) -> io::Error {
-    io::Error::new(io::ErrorKind::Other, err.to_string())
+    io::Error::other(err.to_string())
 }
 
 fn map_config_error(err: ConfigError) -> io::Error {

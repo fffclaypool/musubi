@@ -6,11 +6,19 @@ use crate::application::error::AppError;
 use crate::domain::model::StoredRecord;
 
 use super::core::DocumentService;
+use super::traits::DocumentRead;
 use super::types::{DocumentResponse, DocumentSummary};
 
-impl DocumentService {
-    /// Get a document by ID.
-    pub fn get(&self, id: &str) -> Result<DocumentResponse, AppError> {
+impl DocumentRead for DocumentService {
+    fn default_k(&self) -> usize {
+        self.default_k
+    }
+
+    fn default_ef(&self) -> usize {
+        self.default_ef
+    }
+
+    fn get(&self, id: &str) -> Result<DocumentResponse, AppError> {
         let index_id = self.find_index(id)?;
         let stored = self.records[index_id].clone();
         Ok(DocumentResponse {
@@ -20,8 +28,7 @@ impl DocumentService {
         })
     }
 
-    /// List documents with pagination.
-    pub fn list(&self, offset: usize, limit: usize) -> (usize, Vec<DocumentSummary>) {
+    fn list(&self, offset: usize, limit: usize) -> (usize, Vec<DocumentSummary>) {
         // Filter out tombstones
         let active_records: Vec<(usize, &StoredRecord)> = self
             .records
@@ -47,8 +54,21 @@ impl DocumentService {
         (total, items)
     }
 
-    /// Import pre-computed embeddings.
-    pub fn import_embeddings(&mut self, records: Vec<StoredRecord>) -> Result<usize, AppError> {
+    fn embed_texts(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, AppError> {
+        if texts.is_empty() {
+            return Err(AppError::BadRequest("texts is required".to_string()));
+        }
+        Ok(self.embedder.embed(texts)?)
+    }
+}
+
+// import_embeddings is in DocumentWrite trait, implemented here for code organization
+impl DocumentService {
+    /// Import pre-computed embeddings (part of DocumentWrite trait).
+    pub(super) fn import_embeddings_impl(
+        &mut self,
+        records: Vec<StoredRecord>,
+    ) -> Result<usize, AppError> {
         if records.is_empty() {
             return Ok(0);
         }
@@ -105,13 +125,5 @@ impl DocumentService {
 
         // Return count of active (non-deleted) records
         Ok(self.records.iter().filter(|r| !r.deleted).count())
-    }
-
-    /// Embed a list of texts and return their embeddings.
-    pub fn embed_texts(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, AppError> {
-        if texts.is_empty() {
-            return Err(AppError::BadRequest("texts is required".to_string()));
-        }
-        Ok(self.embedder.embed(texts)?)
     }
 }

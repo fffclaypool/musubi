@@ -1,3 +1,5 @@
+use chrono::NaiveDate;
+
 use crate::domain::model::{Record, StoredRecord};
 use crate::infrastructure::index::hnsw::HnswIndex;
 use crate::infrastructure::storage::file as storage_file;
@@ -5,43 +7,60 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
+const MAGIC_V5: &[u8; 8] = b"MUSUBIW5";
 const MAGIC_V4: &[u8; 8] = b"MUSUBIW4";
 const MAGIC_V3: &[u8; 8] = b"MUSUBIW3";
 const MAGIC_V2: &[u8; 8] = b"MUSUBIW2";
 const MAGIC_V1: &[u8; 8] = b"MUSUBIW1";
-const VERSION: u32 = 4;
+const VERSION: u32 = 5;
 
-const OP_INSERT: u8 = 1;
-const OP_UPDATE: u8 = 2;
-const OP_DELETE: u8 = 3;
-const OP_APPEND: u8 = 4;
+/// Operation kind for Write operations
+const OP_WRITE: u8 = 1;
+const OP_DELETE: u8 = 2;
 
-/// WAL operation for replay
+/// Write operation kind (stored as single byte in WAL)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteKind {
+    /// Insert a new record (upsert semantics)
+    Insert,
+    /// Update an existing record (upsert semantics)
+    Update,
+    /// Append a new record (idempotent: only if no active record exists)
+    Append,
+}
+
+impl WriteKind {
+    fn to_byte(self) -> u8 {
+        match self {
+            Self::Insert => 1,
+            Self::Update => 2,
+            Self::Append => 3,
+        }
+    }
+
+    fn from_byte(b: u8) -> io::Result<Self> {
+        match b {
+            1 => Ok(Self::Insert),
+            2 => Ok(Self::Update),
+            3 => Ok(Self::Append),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unknown write kind: {}", b),
+            )),
+        }
+    }
+}
+
+/// WAL operation for replay (consolidated)
 #[derive(Debug, Clone)]
 pub enum WalOp {
-    /// Insert a new record (upsert: replaces if ID exists)
-    Insert {
-        id: String,
-        record: Record,
-        embedding: Vec<f32>,
-        deleted: bool,
-    },
-    /// Update an existing record (upsert: replaces if ID exists)
-    Update {
-        id: String,
-        record: Record,
-        embedding: Vec<f32>,
-        deleted: bool,
+    /// Write a record (Insert, Update, or Append semantics)
+    Write {
+        kind: WriteKind,
+        record: StoredRecord,
     },
     /// Mark a record as deleted (tombstone)
     Delete { id: String },
-    /// Append a new record (for tombstone-append pattern, idempotent)
-    Append {
-        id: String,
-        record: Record,
-        embedding: Vec<f32>,
-        deleted: bool,
-    },
 }
 
 /// WAL rotation policy - determines when to rotate the WAL file
@@ -105,18 +124,23 @@ impl WalWriter {
             let mut magic = [0u8; 8];
             reader.read_exact(&mut magic)?;
 
-            if &magic == MAGIC_V1 || &magic == MAGIC_V2 || &magic == MAGIC_V3 {
-                // V1/V2/V3 WAL detected - cannot auto-migrate.
+            if &magic == MAGIC_V1 || &magic == MAGIC_V2 || &magic == MAGIC_V3 || &magic == MAGIC_V4
+            {
+                // V1/V2/V3/V4 WAL detected - cannot auto-migrate.
                 // V1: only stored vectors without record metadata.
-                // V2: no deleted flag, format incompatible with v3.
-                // V3: tags stored as Option<String>, incompatible with v4 Vec<Tag> format.
+                // V2: no deleted flag.
+                // V3: tags stored as Option<String>.
+                // V4: separate Insert/Update/Append ops, updated_at as String.
+                // V5: consolidated Write op with WriteKind, updated_at as NaiveDate.
                 // User must verify records.jsonl is complete and manually delete the WAL file.
                 let version_str = if &magic == MAGIC_V1 {
                     "v1"
                 } else if &magic == MAGIC_V2 {
                     "v2"
-                } else {
+                } else if &magic == MAGIC_V3 {
                     "v3"
+                } else {
+                    "v4"
                 };
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -126,12 +150,12 @@ impl WalWriter {
                         version_str, path
                     ),
                 ));
-            } else if &magic != MAGIC_V4 {
+            } else if &magic != MAGIC_V5 {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
                         "invalid wal magic: expected {:?}, got {:?}",
-                        MAGIC_V4, magic
+                        MAGIC_V5, magic
                     ),
                 ));
             }
@@ -151,7 +175,7 @@ impl WalWriter {
         let mut writer = BufWriter::new(file);
 
         if path.metadata()?.len() == 0 {
-            writer.write_all(MAGIC_V4)?;
+            writer.write_all(MAGIC_V5)?;
             write_u32(&mut writer, VERSION)?;
             writer.flush()?;
         }
@@ -163,30 +187,25 @@ impl WalWriter {
         })
     }
 
-    /// Append an INSERT operation to WAL
-    pub fn append_insert(&mut self, stored: &StoredRecord) -> io::Result<()> {
-        self.writer.write_all(&[OP_INSERT])?;
-        write_string(&mut self.writer, &stored.record.id)?;
-        write_record(&mut self.writer, &stored.record)?;
-        write_embedding(&mut self.writer, &stored.embedding)?;
-        write_bool(&mut self.writer, stored.deleted)?;
+    /// Append a write operation to WAL (unified for Insert/Update/Append)
+    fn append_write(&mut self, kind: WriteKind, stored: &StoredRecord) -> io::Result<()> {
+        self.writer.write_all(&[OP_WRITE])?;
+        self.writer.write_all(&[kind.to_byte()])?;
+        write_stored_record(&mut self.writer, stored)?;
         self.writer.flush()?;
         self.writer.get_ref().sync_data()?;
         self.record_count += 1;
         Ok(())
     }
 
+    /// Append an INSERT operation to WAL
+    pub fn append_insert(&mut self, stored: &StoredRecord) -> io::Result<()> {
+        self.append_write(WriteKind::Insert, stored)
+    }
+
     /// Append an UPDATE operation to WAL
     pub fn append_update(&mut self, stored: &StoredRecord) -> io::Result<()> {
-        self.writer.write_all(&[OP_UPDATE])?;
-        write_string(&mut self.writer, &stored.record.id)?;
-        write_record(&mut self.writer, &stored.record)?;
-        write_embedding(&mut self.writer, &stored.embedding)?;
-        write_bool(&mut self.writer, stored.deleted)?;
-        self.writer.flush()?;
-        self.writer.get_ref().sync_data()?;
-        self.record_count += 1;
-        Ok(())
+        self.append_write(WriteKind::Update, stored)
     }
 
     /// Append a DELETE operation to WAL
@@ -201,15 +220,7 @@ impl WalWriter {
 
     /// Append an APPEND operation to WAL (for tombstone-append pattern)
     pub fn append_append(&mut self, stored: &StoredRecord) -> io::Result<()> {
-        self.writer.write_all(&[OP_APPEND])?;
-        write_string(&mut self.writer, &stored.record.id)?;
-        write_record(&mut self.writer, &stored.record)?;
-        write_embedding(&mut self.writer, &stored.embedding)?;
-        write_bool(&mut self.writer, stored.deleted)?;
-        self.writer.flush()?;
-        self.writer.get_ref().sync_data()?;
-        self.record_count += 1;
-        Ok(())
+        self.append_write(WriteKind::Append, stored)
     }
 
     /// Get the current file size in bytes
@@ -245,7 +256,7 @@ impl WalWriter {
             .truncate(true)
             .open(&self.path)?;
         let mut writer = BufWriter::new(file);
-        writer.write_all(MAGIC_V4)?;
+        writer.write_all(MAGIC_V5)?;
         write_u32(&mut writer, VERSION)?;
         writer.flush()?;
         writer.get_ref().sync_data()?;
@@ -271,18 +282,22 @@ pub fn replay<P: AsRef<Path>>(path: P) -> io::Result<Vec<WalOp>> {
     let mut magic = [0u8; 8];
     reader.read_exact(&mut magic)?;
 
-    if &magic == MAGIC_V1 || &magic == MAGIC_V2 || &magic == MAGIC_V3 {
-        // V1/V2/V3 WAL cannot be replayed.
+    if &magic == MAGIC_V1 || &magic == MAGIC_V2 || &magic == MAGIC_V3 || &magic == MAGIC_V4 {
+        // V1/V2/V3/V4 WAL cannot be replayed.
         // V1: only stored vectors without record metadata.
-        // V2: no deleted flag, format incompatible with v3.
-        // V3: tags stored as Option<String>, incompatible with v4 Vec<Tag> format.
+        // V2: no deleted flag.
+        // V3: tags stored as Option<String>.
+        // V4: separate ops, updated_at as String.
+        // V5: consolidated Write op, updated_at as NaiveDate.
         // User must verify data integrity and manually delete the WAL file.
         let version_str = if &magic == MAGIC_V1 {
             "v1"
         } else if &magic == MAGIC_V2 {
             "v2"
-        } else {
+        } else if &magic == MAGIC_V3 {
             "v3"
+        } else {
+            "v4"
         };
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -292,12 +307,12 @@ pub fn replay<P: AsRef<Path>>(path: P) -> io::Result<Vec<WalOp>> {
                 version_str, path
             ),
         ));
-    } else if &magic != MAGIC_V4 {
+    } else if &magic != MAGIC_V5 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
                 "invalid wal magic: expected {:?}, got {:?}",
-                MAGIC_V4, magic
+                MAGIC_V5, magic
             ),
         ));
     }
@@ -320,45 +335,16 @@ pub fn replay<P: AsRef<Path>>(path: P) -> io::Result<Vec<WalOp>> {
         }
 
         match op[0] {
-            OP_INSERT => {
-                let id = read_string(&mut reader)?;
-                let record = read_record(&mut reader, id.clone())?;
-                let embedding = read_embedding(&mut reader)?;
-                let deleted = read_bool(&mut reader)?;
-                ops.push(WalOp::Insert {
-                    id,
-                    record,
-                    embedding,
-                    deleted,
-                });
-            }
-            OP_UPDATE => {
-                let id = read_string(&mut reader)?;
-                let record = read_record(&mut reader, id.clone())?;
-                let embedding = read_embedding(&mut reader)?;
-                let deleted = read_bool(&mut reader)?;
-                ops.push(WalOp::Update {
-                    id,
-                    record,
-                    embedding,
-                    deleted,
-                });
+            OP_WRITE => {
+                let mut kind_byte = [0u8; 1];
+                reader.read_exact(&mut kind_byte)?;
+                let kind = WriteKind::from_byte(kind_byte[0])?;
+                let record = read_stored_record(&mut reader)?;
+                ops.push(WalOp::Write { kind, record });
             }
             OP_DELETE => {
                 let id = read_string(&mut reader)?;
                 ops.push(WalOp::Delete { id });
-            }
-            OP_APPEND => {
-                let id = read_string(&mut reader)?;
-                let record = read_record(&mut reader, id.clone())?;
-                let embedding = read_embedding(&mut reader)?;
-                let deleted = read_bool(&mut reader)?;
-                ops.push(WalOp::Append {
-                    id,
-                    record,
-                    embedding,
-                    deleted,
-                });
             }
             _ => {
                 return Err(io::Error::new(
@@ -373,10 +359,11 @@ pub fn replay<P: AsRef<Path>>(path: P) -> io::Result<Vec<WalOp>> {
 }
 
 /// Apply WAL operations to records list (idempotent replay)
-/// - INSERT: upsert (replaces if ID exists, otherwise appends)
-/// - UPDATE: upsert (replaces if ID exists, otherwise appends)
-/// - DELETE: tombstones first occurrence if not already tombstoned (idempotent)
-/// - APPEND: appends only if no active record with same ID exists (idempotent)
+/// - Write(Insert): upsert (replaces if ID exists, otherwise appends)
+/// - Write(Update): upsert (replaces if ID exists, otherwise appends)
+/// - Write(Append): appends only if no active record with same ID exists (idempotent)
+/// - Delete: tombstones first occurrence if not already tombstoned (idempotent)
+///
 /// Returns true if any changes were made
 pub fn apply_ops_to_records(ops: Vec<WalOp>, records: &mut Vec<StoredRecord>) -> bool {
     if ops.is_empty() {
@@ -385,32 +372,25 @@ pub fn apply_ops_to_records(ops: Vec<WalOp>, records: &mut Vec<StoredRecord>) ->
 
     for op in ops {
         match op {
-            WalOp::Insert {
-                id,
-                record,
-                embedding,
-                deleted,
-            } => {
-                // Upsert: replace if exists, insert if not
-                let stored = StoredRecord::with_deleted(record, embedding, deleted);
-                if let Some(pos) = records.iter().position(|r| r.record.id == id) {
-                    records[pos] = stored;
-                } else {
-                    records.push(stored);
-                }
-            }
-            WalOp::Update {
-                id,
-                record,
-                embedding,
-                deleted,
-            } => {
-                // Upsert: replace if exists, insert if not
-                let stored = StoredRecord::with_deleted(record, embedding, deleted);
-                if let Some(pos) = records.iter().position(|r| r.record.id == id) {
-                    records[pos] = stored;
-                } else {
-                    records.push(stored);
+            WalOp::Write { kind, record } => {
+                let id = record.record.id.clone();
+                match kind {
+                    WriteKind::Insert | WriteKind::Update => {
+                        // Upsert: replace if exists, insert if not
+                        if let Some(pos) = records.iter().position(|r| r.record.id == id) {
+                            records[pos] = record;
+                        } else {
+                            records.push(record);
+                        }
+                    }
+                    WriteKind::Append => {
+                        // Idempotent: only append if no active record with same ID exists
+                        let has_active = records.iter().any(|r| r.record.id == id && !r.deleted);
+                        if !has_active {
+                            records.push(record);
+                        }
+                        // If active exists, skip (already applied)
+                    }
                 }
             }
             WalOp::Delete { id } => {
@@ -421,20 +401,6 @@ pub fn apply_ops_to_records(ops: Vec<WalOp>, records: &mut Vec<StoredRecord>) ->
                     }
                     // If already deleted, skip (idempotent)
                 }
-            }
-            WalOp::Append {
-                id,
-                record,
-                embedding,
-                deleted,
-            } => {
-                // Idempotent: only append if no active record with same ID exists
-                let has_active = records.iter().any(|r| r.record.id == id && !r.deleted);
-                if !has_active {
-                    let stored = StoredRecord::with_deleted(record, embedding, deleted);
-                    records.push(stored);
-                }
-                // If active exists, skip (already applied)
             }
         }
     }
@@ -471,11 +437,11 @@ fn count_records<R: Read>(reader: &mut R) -> io::Result<usize> {
         }
 
         match op[0] {
-            OP_INSERT | OP_UPDATE | OP_APPEND => {
-                let id = read_string(reader)?;
-                let _ = read_record(reader, id)?;
-                let _ = read_embedding(reader)?;
-                let _ = read_bool(reader)?; // deleted flag
+            OP_WRITE => {
+                let mut kind_byte = [0u8; 1];
+                reader.read_exact(&mut kind_byte)?;
+                let _ = WriteKind::from_byte(kind_byte[0])?;
+                let _ = read_stored_record(reader)?;
                 count += 1;
             }
             OP_DELETE => {
@@ -549,19 +515,21 @@ fn read_optional_string<R: Read>(reader: &mut R) -> io::Result<Option<String>> {
 }
 
 fn write_record<W: Write>(writer: &mut W, record: &Record) -> io::Result<()> {
-    // Write record fields as optional strings (excluding id which is written separately)
+    // Write record fields (excluding id which is written separately)
+    write_string(writer, &record.id)?;
     write_optional_string(writer, &record.title)?;
     write_optional_string(writer, &record.body)?;
     write_optional_string(writer, &record.source)?;
-    write_optional_string(writer, &record.updated_at)?;
+    write_optional_date(writer, &record.updated_at)?;
     write_tags(writer, &record.tags)
 }
 
-fn read_record<R: Read>(reader: &mut R, id: String) -> io::Result<Record> {
+fn read_record<R: Read>(reader: &mut R) -> io::Result<Record> {
+    let id = read_string(reader)?;
     let title = read_optional_string(reader)?;
     let body = read_optional_string(reader)?;
     let source = read_optional_string(reader)?;
-    let updated_at = read_optional_string(reader)?;
+    let updated_at = read_optional_date(reader)?;
     let tags = read_tags(reader)?;
     Ok(Record {
         id,
@@ -571,6 +539,50 @@ fn read_record<R: Read>(reader: &mut R, id: String) -> io::Result<Record> {
         updated_at,
         tags,
     })
+}
+
+fn write_stored_record<W: Write>(writer: &mut W, stored: &StoredRecord) -> io::Result<()> {
+    write_record(writer, &stored.record)?;
+    write_embedding(writer, &stored.embedding)?;
+    write_bool(writer, stored.deleted)
+}
+
+fn read_stored_record<R: Read>(reader: &mut R) -> io::Result<StoredRecord> {
+    let record = read_record(reader)?;
+    let embedding = read_embedding(reader)?;
+    let deleted = read_bool(reader)?;
+    Ok(StoredRecord::with_deleted(record, embedding, deleted))
+}
+
+fn write_optional_date<W: Write>(writer: &mut W, date: &Option<NaiveDate>) -> io::Result<()> {
+    match date {
+        Some(d) => {
+            writer.write_all(&[1])?;
+            // Store as days since epoch (i32)
+            let days = d
+                .signed_duration_since(NaiveDate::from_ymd_opt(1970, 1, 1).unwrap())
+                .num_days() as i32;
+            writer.write_all(&days.to_le_bytes())
+        }
+        None => writer.write_all(&[0]),
+    }
+}
+
+fn read_optional_date<R: Read>(reader: &mut R) -> io::Result<Option<NaiveDate>> {
+    let mut flag = [0u8; 1];
+    reader.read_exact(&mut flag)?;
+    if flag[0] == 0 {
+        Ok(None)
+    } else {
+        let mut buf = [0u8; 4];
+        reader.read_exact(&mut buf)?;
+        let days = i32::from_le_bytes(buf);
+        let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+        epoch
+            .checked_add_signed(chrono::Duration::days(days as i64))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid date"))
+            .map(Some)
+    }
 }
 
 fn write_tags<W: Write>(writer: &mut W, tags: &[crate::domain::model::Tag]) -> io::Result<()> {
@@ -663,22 +675,18 @@ mod tests {
         assert_eq!(ops.len(), 1);
 
         match &ops[0] {
-            WalOp::Insert {
-                id,
-                record,
-                embedding,
-                deleted,
-            } => {
-                assert_eq!(id, "doc-1");
-                assert_eq!(record.title, Some("Title".to_string()));
-                assert_eq!(record.body, Some("Body text".to_string()));
-                assert_eq!(record.tags.len(), 2);
-                assert_eq!(record.tags[0].as_str(), "tag1");
-                assert_eq!(record.tags[1].as_str(), "tag2");
-                assert_eq!(embedding, &vec![1.0, 0.0, 0.5]);
-                assert!(!deleted);
+            WalOp::Write { kind, record } => {
+                assert_eq!(*kind, WriteKind::Insert);
+                assert_eq!(record.record.id, "doc-1");
+                assert_eq!(record.record.title, Some("Title".to_string()));
+                assert_eq!(record.record.body, Some("Body text".to_string()));
+                assert_eq!(record.record.tags.len(), 2);
+                assert_eq!(record.record.tags[0].as_str(), "tag1");
+                assert_eq!(record.record.tags[1].as_str(), "tag2");
+                assert_eq!(record.embedding, vec![1.0, 0.0, 0.5]);
+                assert!(!record.deleted);
             }
-            _ => panic!("Expected Insert operation"),
+            _ => panic!("Expected Write operation"),
         }
 
         std::fs::remove_file(&wal_path).ok();
@@ -723,8 +731,20 @@ mod tests {
         let ops = replay(&wal_path).unwrap();
         assert_eq!(ops.len(), 3);
 
-        assert!(matches!(&ops[0], WalOp::Insert { .. }));
-        assert!(matches!(&ops[1], WalOp::Update { .. }));
+        assert!(matches!(
+            &ops[0],
+            WalOp::Write {
+                kind: WriteKind::Insert,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &ops[1],
+            WalOp::Write {
+                kind: WriteKind::Update,
+                ..
+            }
+        ));
         assert!(matches!(&ops[2], WalOp::Delete { id } if id == "doc-1"));
 
         std::fs::remove_file(&wal_path).ok();
@@ -735,44 +755,47 @@ mod tests {
         let mut records = Vec::new();
 
         let ops = vec![
-            WalOp::Insert {
-                id: "doc-1".to_string(),
-                record: Record {
-                    id: "doc-1".to_string(),
-                    title: Some("Title1".to_string()),
-                    body: None,
-                    source: None,
-                    updated_at: None,
-                    tags: vec![],
-                },
-                embedding: vec![1.0, 0.0],
-                deleted: false,
+            WalOp::Write {
+                kind: WriteKind::Insert,
+                record: StoredRecord::new(
+                    Record {
+                        id: "doc-1".to_string(),
+                        title: Some("Title1".to_string()),
+                        body: None,
+                        source: None,
+                        updated_at: None,
+                        tags: vec![],
+                    },
+                    vec![1.0, 0.0],
+                ),
             },
-            WalOp::Insert {
-                id: "doc-2".to_string(),
-                record: Record {
-                    id: "doc-2".to_string(),
-                    title: Some("Title2".to_string()),
-                    body: None,
-                    source: None,
-                    updated_at: None,
-                    tags: vec![],
-                },
-                embedding: vec![0.0, 1.0],
-                deleted: false,
+            WalOp::Write {
+                kind: WriteKind::Insert,
+                record: StoredRecord::new(
+                    Record {
+                        id: "doc-2".to_string(),
+                        title: Some("Title2".to_string()),
+                        body: None,
+                        source: None,
+                        updated_at: None,
+                        tags: vec![],
+                    },
+                    vec![0.0, 1.0],
+                ),
             },
-            WalOp::Update {
-                id: "doc-1".to_string(),
-                record: Record {
-                    id: "doc-1".to_string(),
-                    title: Some("Updated Title1".to_string()),
-                    body: Some("New body".to_string()),
-                    source: None,
-                    updated_at: None,
-                    tags: vec![],
-                },
-                embedding: vec![0.5, 0.5],
-                deleted: false,
+            WalOp::Write {
+                kind: WriteKind::Update,
+                record: StoredRecord::new(
+                    Record {
+                        id: "doc-1".to_string(),
+                        title: Some("Updated Title1".to_string()),
+                        body: Some("New body".to_string()),
+                        source: None,
+                        updated_at: None,
+                        tags: vec![],
+                    },
+                    vec![0.5, 0.5],
+                ),
             },
             WalOp::Delete {
                 id: "doc-2".to_string(),
@@ -1183,6 +1206,33 @@ mod tests {
     }
 
     #[test]
+    fn test_wal_v4_detection() {
+        let wal_path = temp_path("wal_v4_detection");
+
+        // Write a v4 WAL file (separate ops, updated_at as String)
+        {
+            let mut file = File::create(&wal_path).unwrap();
+            file.write_all(b"MUSUBIW4").unwrap(); // v4 magic
+            file.write_all(&4u32.to_le_bytes()).unwrap(); // version 4
+            file.flush().unwrap();
+        }
+
+        // replay should return an error for v4 WAL
+        let result = replay(&wal_path);
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        assert!(err.to_string().contains("WAL v4 detected"));
+
+        // WalWriter::new should also return an error for v4 WAL
+        let result = WalWriter::new(&wal_path);
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        assert!(err.to_string().contains("WAL v4 detected"));
+
+        std::fs::remove_file(&wal_path).ok();
+    }
+
+    #[test]
     fn test_apply_ops_upsert_semantics() {
         // Test that INSERT uses upsert (replaces if exists)
         let mut records = vec![StoredRecord::new(
@@ -1197,18 +1247,19 @@ mod tests {
             vec![1.0, 0.0],
         )];
 
-        let ops = vec![WalOp::Insert {
-            id: "doc-1".to_string(),
-            record: Record {
-                id: "doc-1".to_string(),
-                title: Some("Replaced via INSERT".to_string()),
-                body: None,
-                source: None,
-                updated_at: None,
-                tags: vec![],
-            },
-            embedding: vec![0.5, 0.5],
-            deleted: false,
+        let ops = vec![WalOp::Write {
+            kind: WriteKind::Insert,
+            record: StoredRecord::new(
+                Record {
+                    id: "doc-1".to_string(),
+                    title: Some("Replaced via INSERT".to_string()),
+                    body: None,
+                    source: None,
+                    updated_at: None,
+                    tags: vec![],
+                },
+                vec![0.5, 0.5],
+            ),
         }];
 
         apply_ops_to_records(ops, &mut records);
@@ -1219,18 +1270,19 @@ mod tests {
         );
 
         // Test that UPDATE uses upsert (inserts if not exists)
-        let ops = vec![WalOp::Update {
-            id: "doc-new".to_string(),
-            record: Record {
-                id: "doc-new".to_string(),
-                title: Some("Inserted via UPDATE".to_string()),
-                body: None,
-                source: None,
-                updated_at: None,
-                tags: vec![],
-            },
-            embedding: vec![0.8, 0.2],
-            deleted: false,
+        let ops = vec![WalOp::Write {
+            kind: WriteKind::Update,
+            record: StoredRecord::new(
+                Record {
+                    id: "doc-new".to_string(),
+                    title: Some("Inserted via UPDATE".to_string()),
+                    body: None,
+                    source: None,
+                    updated_at: None,
+                    tags: vec![],
+                },
+                vec![0.8, 0.2],
+            ),
         }];
 
         apply_ops_to_records(ops, &mut records);
@@ -1262,18 +1314,19 @@ mod tests {
             WalOp::Delete {
                 id: "doc-1".to_string(),
             },
-            WalOp::Append {
-                id: "doc-1".to_string(),
-                record: Record {
-                    id: "doc-1".to_string(),
-                    title: Some("New version".to_string()),
-                    body: None,
-                    source: None,
-                    updated_at: None,
-                    tags: vec![],
-                },
-                embedding: vec![0.5, 0.5],
-                deleted: false,
+            WalOp::Write {
+                kind: WriteKind::Append,
+                record: StoredRecord::new(
+                    Record {
+                        id: "doc-1".to_string(),
+                        title: Some("New version".to_string()),
+                        body: None,
+                        source: None,
+                        updated_at: None,
+                        tags: vec![],
+                    },
+                    vec![0.5, 0.5],
+                ),
             },
         ];
 
@@ -1320,18 +1373,19 @@ mod tests {
             WalOp::Delete {
                 id: "doc-1".to_string(),
             },
-            WalOp::Append {
-                id: "doc-1".to_string(),
-                record: Record {
-                    id: "doc-1".to_string(),
-                    title: Some("New version".to_string()),
-                    body: None,
-                    source: None,
-                    updated_at: None,
-                    tags: vec![],
-                },
-                embedding: vec![0.5, 0.5],
-                deleted: false,
+            WalOp::Write {
+                kind: WriteKind::Append,
+                record: StoredRecord::new(
+                    Record {
+                        id: "doc-1".to_string(),
+                        title: Some("New version".to_string()),
+                        body: None,
+                        source: None,
+                        updated_at: None,
+                        tags: vec![],
+                    },
+                    vec![0.5, 0.5],
+                ),
             },
         ];
 

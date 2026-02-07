@@ -3,8 +3,8 @@
 #[cfg(test)]
 mod integration_tests {
     use crate::application::service::{
-        ChunkConfig, DocumentService, InsertCommand, SearchRequest, ServiceConfig, TombstoneConfig,
-        UpdateCommand, ValidatedSearchQuery,
+        ChunkConfig, DocumentRead, DocumentSearch, DocumentService, DocumentWrite, InsertCommand,
+        SearchRequest, ServiceConfig, TombstoneConfig, UpdateCommand, ValidatedSearchQuery,
     };
     use crate::domain::model::{Chunk, Record, StoredChunk, StoredRecord};
     use crate::domain::ports::{

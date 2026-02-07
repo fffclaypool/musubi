@@ -15,7 +15,7 @@ impl HttpEmbedder {
         let client = Client::builder()
             .timeout(Duration::from_secs(300))
             .build()
-            .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
+            .map_err(io::Error::other)?;
         Ok(Self {
             client,
             url: url.into(),
@@ -57,7 +57,7 @@ impl Embedder for HttpEmbedder {
             let message = error
                 .map(|e| e.detail)
                 .unwrap_or_else(|_| format!("HTTP {}", status));
-            return Err(io::Error::new(io::ErrorKind::Other, message));
+            return Err(io::Error::other(message));
         }
 
         let result: EmbedResponse = response

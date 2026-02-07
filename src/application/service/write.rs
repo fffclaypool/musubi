@@ -4,14 +4,14 @@ use crate::application::error::AppError;
 use crate::domain::model::{Record, StoredChunk, StoredRecord};
 
 use super::core::DocumentService;
+use super::traits::DocumentWrite;
 use super::types::{
     DocumentResponse, IndexingMode, InsertCommand, InsertResult, UpdateCommand, UpdateEffect,
 };
 use super::util::build_text;
 
-impl DocumentService {
-    /// Insert a new document.
-    pub fn insert(&mut self, cmd: InsertCommand) -> Result<InsertResult, AppError> {
+impl DocumentWrite for DocumentService {
+    fn insert(&mut self, cmd: InsertCommand) -> Result<InsertResult, AppError> {
         if cmd.record.id.trim().is_empty() {
             return Err(AppError::BadRequest("id is required".to_string()));
         }
@@ -33,6 +33,7 @@ impl DocumentService {
                 chunk_store,
                 chunks,
                 chunk_mapping,
+                chunk_index,
             } => {
                 // Chunking mode: split text into chunks and index each chunk
                 let text_chunks = chunker.chunk(&text);
@@ -71,6 +72,10 @@ impl DocumentService {
 
                     // Update chunk mapping
                     chunk_mapping.push((record_idx, chunk.chunk_index));
+
+                    // Add to O(1) chunk index
+                    let chunk_pos = chunks.len();
+                    chunk_index.insert((cmd.record.id.clone(), chunk.chunk_index), chunk_pos);
 
                     // Store chunk
                     chunks.push(stored_chunk.clone());
@@ -124,8 +129,7 @@ impl DocumentService {
         }
     }
 
-    /// Update an existing document.
-    pub fn update(&mut self, id: &str, cmd: UpdateCommand) -> Result<DocumentResponse, AppError> {
+    fn update(&mut self, id: &str, cmd: UpdateCommand) -> Result<DocumentResponse, AppError> {
         let index_id = self.find_index(id)?;
         let current = self.records[index_id].clone();
 
@@ -164,12 +168,16 @@ impl DocumentService {
                         chunk_store,
                         chunks,
                         chunk_mapping,
+                        chunk_index,
                     } => {
                         // Chunking mode: re-chunk and re-index
 
                         // Mark old record as deleted
                         self.records[index_id].deleted = true;
                         self.tombstone_count += 1;
+
+                        // Remove old chunks from O(1) index
+                        chunk_index.retain(|(pid, _), _| pid != id);
 
                         // Mark all old chunks for this document as deleted
                         for chunk in chunks.iter_mut() {
@@ -222,6 +230,10 @@ impl DocumentService {
 
                             // Update chunk mapping
                             chunk_mapping.push((new_record_idx, chunk.chunk_index));
+
+                            // Add to O(1) chunk index
+                            let chunk_pos = chunks.len();
+                            chunk_index.insert((updated.id.clone(), chunk.chunk_index), chunk_pos);
 
                             // Store chunk
                             chunks.push(stored_chunk);
@@ -323,8 +335,7 @@ impl DocumentService {
         }
     }
 
-    /// Delete a document by ID.
-    pub fn delete(&mut self, id: &str) -> Result<(), AppError> {
+    fn delete(&mut self, id: &str) -> Result<(), AppError> {
         let index_id = self.find_index(id)?;
 
         // Write to WAL first
@@ -343,9 +354,13 @@ impl DocumentService {
         if let IndexingMode::Chunked {
             chunks,
             chunk_store,
+            chunk_index,
             ..
         } = &mut self.indexing_mode
         {
+            // Remove from O(1) chunk index
+            chunk_index.retain(|(pid, _), _| pid != id);
+
             for chunk in chunks.iter_mut() {
                 if chunk.parent_id == id {
                     chunk.deleted = true;
@@ -364,5 +379,9 @@ impl DocumentService {
         self.maybe_rotate_wal()?;
 
         Ok(())
+    }
+
+    fn import_embeddings(&mut self, records: Vec<StoredRecord>) -> Result<usize, AppError> {
+        self.import_embeddings_impl(records)
     }
 }

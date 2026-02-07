@@ -158,11 +158,19 @@ impl DocumentService {
         let indexing_mode = match (chunker, chunk_store) {
             (Some(chunker), Some(chunk_store)) => {
                 let chunk_mapping = build_chunk_mapping(&chunks, &records);
+                // Build O(1) chunk index
+                let chunk_index = chunks
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, c)| !c.deleted)
+                    .map(|(pos, c)| ((c.parent_id.clone(), c.chunk.chunk_index), pos))
+                    .collect();
                 IndexingMode::Chunked {
                     chunker,
                     chunk_store,
                     chunks,
                     chunk_mapping,
+                    chunk_index,
                 }
             }
             _ => IndexingMode::Direct,
@@ -212,6 +220,7 @@ impl DocumentService {
             chunk_store,
             chunks,
             chunk_mapping,
+            chunk_index,
         } = &mut self.indexing_mode
         else {
             return Ok(()); // Direct mode, nothing to do
@@ -278,6 +287,10 @@ impl DocumentService {
 
                 // Update chunk mapping
                 chunk_mapping.push((record_idx, chunk.chunk_index));
+
+                // Add to O(1) chunk index
+                let chunk_pos = chunks.len();
+                chunk_index.insert((record_id.clone(), chunk.chunk_index), chunk_pos);
 
                 // Store chunk
                 chunks.push(stored_chunk);

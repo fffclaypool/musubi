@@ -12,6 +12,9 @@ pub trait VectorIndex: Send + Sync {
     fn search(&self, query: &[f32], k: usize, ef: usize) -> Vec<SearchResult>;
     fn vector(&self, id: usize) -> Option<&Vector>;
     fn len(&self) -> usize;
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
     fn dim(&self) -> usize;
     fn save(&self, path: &Path) -> io::Result<()>;
 }
