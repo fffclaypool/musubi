@@ -413,16 +413,52 @@ pub struct ChunkInfo {
     pub text_preview: Option<String>,
 }
 
+/// Score breakdown by search mode - ensures type-level consistency
+/// between search mode and available scores
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ScoreBreakdown {
+    /// Vector similarity search only
+    VectorOnly {
+        /// L2 distance (lower is better)
+        distance: f32,
+    },
+    /// BM25 keyword search only
+    Bm25Only {
+        /// Raw BM25 score (higher is better)
+        bm25_score: f64,
+    },
+    /// Hybrid search combining vector and BM25
+    Hybrid {
+        /// L2 distance (lower is better), None if only BM25 matched
+        #[serde(skip_serializing_if = "Option::is_none")]
+        distance: Option<f32>,
+        /// Raw BM25 score (higher is better), None if only vector matched
+        #[serde(skip_serializing_if = "Option::is_none")]
+        bm25_score: Option<f64>,
+        /// Combined hybrid score (higher is better)
+        hybrid_score: f64,
+    },
+}
+
+impl ScoreBreakdown {
+    /// Get the primary score used for ranking (higher is better)
+    pub fn ranking_score(&self) -> f64 {
+        match self {
+            Self::VectorOnly { distance } => -(*distance as f64), // Negate: lower distance = higher score
+            Self::Bm25Only { bm25_score } => *bm25_score,
+            Self::Hybrid { hybrid_score, .. } => *hybrid_score,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SearchHit {
     pub index_id: usize,
     pub id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub distance: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub bm25_score: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub hybrid_score: Option<f64>,
+    /// Score breakdown matching the search mode
+    #[serde(flatten)]
+    pub score: ScoreBreakdown,
     pub title: Option<String>,
     pub source: Option<String>,
     pub tags: Option<String>,
