@@ -161,17 +161,53 @@ pub struct UpdateCommand {
     pub text: Option<String>,
 }
 
+/// Tag filter mode for SearchFilter
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum TagFilter {
+    /// No tag filtering
+    #[default]
+    None,
+    /// Match if any of these tags are present
+    Any(Vec<String>),
+    /// Match only if all of these tags are present
+    All(Vec<String>),
+}
+
+impl TagFilter {
+    /// Check if record tags match this filter
+    fn matches(&self, record_tags: &HashSet<String>) -> bool {
+        match self {
+            Self::None => true,
+            Self::Any(filter_tags) => {
+                filter_tags.is_empty()
+                    || filter_tags
+                        .iter()
+                        .any(|t| record_tags.contains(&t.trim().to_lowercase()))
+            }
+            Self::All(filter_tags) => {
+                filter_tags.is_empty()
+                    || filter_tags
+                        .iter()
+                        .all(|t| record_tags.contains(&t.trim().to_lowercase()))
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SearchFilter {
     /// Exact match on source field
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
-    /// Match if any of these tags are present (comma-separated tags)
-    pub tags_any: Option<Vec<String>>,
-    /// Match only if all of these tags are present (comma-separated tags)
-    pub tags_all: Option<Vec<String>>,
+    /// Tag filter (none, any, or all)
+    #[serde(default, flatten)]
+    pub tag_filter: TagFilter,
     /// Match if updated_at >= this value (string comparison, YYYY-MM-DD)
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub updated_at_gte: Option<String>,
     /// Match if updated_at <= this value (string comparison, YYYY-MM-DD)
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub updated_at_lte: Option<String>,
 }
 
@@ -186,33 +222,13 @@ impl SearchFilter {
             }
         }
 
-        // tags_any: at least one tag matches
-        if let Some(ref filter_tags) = self.tags_any {
-            if !filter_tags.is_empty() {
-                let record_tags = parse_tags(record.tags.as_deref());
-                let has_any = filter_tags
-                    .iter()
-                    .any(|t| record_tags.contains(&t.trim().to_lowercase()));
-                if !has_any {
-                    return false;
-                }
-            }
+        // tag filter
+        let record_tags = parse_tags(record.tags.as_deref());
+        if !self.tag_filter.matches(&record_tags) {
+            return false;
         }
 
-        // tags_all: all tags must be present
-        if let Some(ref filter_tags) = self.tags_all {
-            if !filter_tags.is_empty() {
-                let record_tags = parse_tags(record.tags.as_deref());
-                let has_all = filter_tags
-                    .iter()
-                    .all(|t| record_tags.contains(&t.trim().to_lowercase()));
-                if !has_all {
-                    return false;
-                }
-            }
-        }
-
-        // updated_at_gte: string comparison
+        // updated_at_gte
         if let Some(ref gte) = self.updated_at_gte {
             match &record.updated_at {
                 Some(updated_at) if updated_at.as_str() >= gte.as_str() => {}
@@ -220,7 +236,7 @@ impl SearchFilter {
             }
         }
 
-        // updated_at_lte: string comparison
+        // updated_at_lte
         if let Some(ref lte) = self.updated_at_lte {
             match &record.updated_at {
                 Some(updated_at) if updated_at.as_str() <= lte.as_str() => {}
@@ -580,7 +596,7 @@ mod tests {
     #[test]
     fn test_filter_tags_any() {
         let filter = SearchFilter {
-            tags_any: Some(vec!["ai".to_string(), "ml".to_string()]),
+            tag_filter: TagFilter::Any(vec!["ai".to_string(), "ml".to_string()]),
             ..Default::default()
         };
 
@@ -604,7 +620,7 @@ mod tests {
     #[test]
     fn test_filter_tags_all() {
         let filter = SearchFilter {
-            tags_all: Some(vec!["ai".to_string(), "rust".to_string()]),
+            tag_filter: TagFilter::All(vec!["ai".to_string(), "rust".to_string()]),
             ..Default::default()
         };
 
@@ -624,7 +640,7 @@ mod tests {
     #[test]
     fn test_filter_tags_case_insensitive() {
         let filter = SearchFilter {
-            tags_any: Some(vec!["AI".to_string(), "RUST".to_string()]),
+            tag_filter: TagFilter::Any(vec!["AI".to_string(), "RUST".to_string()]),
             ..Default::default()
         };
 
@@ -632,7 +648,7 @@ mod tests {
         assert!(filter.matches(&record));
 
         let filter2 = SearchFilter {
-            tags_all: Some(vec!["AI".to_string()]),
+            tag_filter: TagFilter::All(vec!["AI".to_string()]),
             ..Default::default()
         };
         assert!(filter2.matches(&record));
@@ -641,7 +657,7 @@ mod tests {
     #[test]
     fn test_filter_tags_with_whitespace() {
         let filter = SearchFilter {
-            tags_any: Some(vec!["ai".to_string()]),
+            tag_filter: TagFilter::Any(vec!["ai".to_string()]),
             ..Default::default()
         };
 
@@ -710,7 +726,7 @@ mod tests {
     fn test_filter_combined() {
         let filter = SearchFilter {
             source: Some("news".to_string()),
-            tags_any: Some(vec!["ai".to_string(), "rust".to_string()]),
+            tag_filter: TagFilter::Any(vec!["ai".to_string(), "rust".to_string()]),
             updated_at_gte: Some("2024-01-01".to_string()),
             ..Default::default()
         };
