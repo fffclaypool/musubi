@@ -1,0 +1,571 @@
+//! Type definitions for the document service.
+
+use crate::domain::model::Record;
+use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
+
+/// Policy for tombstone-based compaction
+#[derive(Debug, Clone)]
+pub enum TombstonePolicy {
+    /// No automatic compaction
+    Disabled,
+    /// Compact when tombstone count reaches this threshold
+    MaxCount(usize),
+    /// Compact when tombstone ratio (tombstones / total) reaches this threshold (0.0 - 1.0)
+    MaxRatio(f64),
+}
+
+impl Default for TombstonePolicy {
+    fn default() -> Self {
+        // Default: compact when 30% are tombstones
+        Self::MaxRatio(0.3)
+    }
+}
+
+/// Configuration for tombstone-based compaction
+#[derive(Debug, Clone)]
+pub struct TombstoneConfig {
+    /// Maximum number of tombstones before triggering compaction
+    pub max_tombstones: Option<usize>,
+    /// Maximum ratio of tombstones to total records before triggering compaction (0.0 - 1.0)
+    pub max_tombstone_ratio: Option<f64>,
+}
+
+impl Default for TombstoneConfig {
+    fn default() -> Self {
+        Self {
+            max_tombstones: None,
+            max_tombstone_ratio: Some(0.3), // Default: compact when 30% are tombstones
+        }
+    }
+}
+
+impl TombstoneConfig {
+    /// Convert to TombstonePolicy, validating that at most one option is set
+    pub fn into_policy(self) -> Result<TombstonePolicy, &'static str> {
+        match (self.max_tombstones, self.max_tombstone_ratio) {
+            (None, None) => Ok(TombstonePolicy::Disabled),
+            (Some(count), None) => Ok(TombstonePolicy::MaxCount(count)),
+            (None, Some(ratio)) => {
+                if ratio.is_nan() || !(0.0..=1.0).contains(&ratio) {
+                    return Err("max_tombstone_ratio must be between 0.0 and 1.0");
+                }
+                Ok(TombstonePolicy::MaxRatio(ratio))
+            }
+            (Some(_), Some(_)) => Err("cannot set both max_tombstones and max_tombstone_ratio"),
+        }
+    }
+}
+
+/// Search mode determining the balance between vector and BM25 search
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SearchMode {
+    /// Pure vector similarity search (alpha = 1.0)
+    VectorOnly,
+    /// Pure BM25 keyword search (alpha = 0.0)
+    Bm25Only,
+    /// Hybrid search combining vector and BM25 with given weight
+    /// alpha is the weight for vector score (0.0 < alpha < 1.0)
+    Hybrid { alpha: f64 },
+}
+
+impl SearchMode {
+    /// Create SearchMode from alpha value with validation
+    ///
+    /// # Errors
+    /// Returns error if alpha is NaN or outside [0.0, 1.0]
+    pub fn from_alpha(alpha: f64) -> Result<Self, &'static str> {
+        if alpha.is_nan() {
+            return Err("alpha must not be NaN");
+        }
+        if !(0.0..=1.0).contains(&alpha) {
+            return Err("alpha must be between 0.0 and 1.0");
+        }
+
+        if alpha == 1.0 {
+            Ok(Self::VectorOnly)
+        } else if alpha == 0.0 {
+            Ok(Self::Bm25Only)
+        } else {
+            Ok(Self::Hybrid { alpha })
+        }
+    }
+
+    /// Get the alpha value for this search mode
+    pub fn alpha(&self) -> f64 {
+        match self {
+            Self::VectorOnly => 1.0,
+            Self::Bm25Only => 0.0,
+            Self::Hybrid { alpha } => *alpha,
+        }
+    }
+
+    /// Returns true if vector search is needed
+    pub fn needs_vector(&self) -> bool {
+        !matches!(self, Self::Bm25Only)
+    }
+
+    /// Returns true if BM25 search is needed
+    pub fn needs_bm25(&self) -> bool {
+        !matches!(self, Self::VectorOnly)
+    }
+}
+
+/// Configuration for document chunking
+#[derive(Debug, Clone, Default)]
+pub enum ChunkConfig {
+    /// No chunking - treat each document as a single unit (default, backward compatible)
+    #[default]
+    None,
+    /// Fixed-size chunking with overlap
+    Fixed {
+        /// Target chunk size in characters
+        chunk_size: usize,
+        /// Number of characters to overlap between chunks
+        overlap: usize,
+    },
+    /// Semantic chunking based on sentence similarity
+    Semantic {
+        /// Minimum chunk size in characters
+        min_chunk_size: usize,
+        /// Maximum chunk size in characters
+        max_chunk_size: usize,
+        /// Similarity threshold (0.0-1.0) - split when similarity drops below this
+        similarity_threshold: f32,
+    },
+}
+
+/// Service configuration
+pub struct ServiceConfig {
+    pub snapshot_path: std::path::PathBuf,
+    pub default_k: usize,
+    pub default_ef: usize,
+    pub wal_config: Option<crate::infrastructure::storage::wal::WalConfig>,
+    pub tombstone_config: TombstoneConfig,
+    pub chunk_config: ChunkConfig,
+}
+
+#[derive(Debug, Clone)]
+pub struct InsertCommand {
+    pub record: Record,
+    pub text: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpdateCommand {
+    pub title: Option<String>,
+    pub body: Option<String>,
+    pub source: Option<String>,
+    pub updated_at: Option<String>,
+    pub tags: Option<String>,
+    pub text: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SearchFilter {
+    /// Exact match on source field
+    pub source: Option<String>,
+    /// Match if any of these tags are present (comma-separated tags)
+    pub tags_any: Option<Vec<String>>,
+    /// Match only if all of these tags are present (comma-separated tags)
+    pub tags_all: Option<Vec<String>>,
+    /// Match if updated_at >= this value (string comparison, YYYY-MM-DD)
+    pub updated_at_gte: Option<String>,
+    /// Match if updated_at <= this value (string comparison, YYYY-MM-DD)
+    pub updated_at_lte: Option<String>,
+}
+
+impl SearchFilter {
+    /// Check if a record matches all filter criteria
+    pub fn matches(&self, record: &Record) -> bool {
+        // source: exact match
+        if let Some(ref filter_source) = self.source {
+            match &record.source {
+                Some(record_source) if record_source == filter_source => {}
+                _ => return false,
+            }
+        }
+
+        // tags_any: at least one tag matches
+        if let Some(ref filter_tags) = self.tags_any {
+            if !filter_tags.is_empty() {
+                let record_tags = parse_tags(record.tags.as_deref());
+                let has_any = filter_tags
+                    .iter()
+                    .any(|t| record_tags.contains(&t.trim().to_lowercase()));
+                if !has_any {
+                    return false;
+                }
+            }
+        }
+
+        // tags_all: all tags must be present
+        if let Some(ref filter_tags) = self.tags_all {
+            if !filter_tags.is_empty() {
+                let record_tags = parse_tags(record.tags.as_deref());
+                let has_all = filter_tags
+                    .iter()
+                    .all(|t| record_tags.contains(&t.trim().to_lowercase()));
+                if !has_all {
+                    return false;
+                }
+            }
+        }
+
+        // updated_at_gte: string comparison
+        if let Some(ref gte) = self.updated_at_gte {
+            match &record.updated_at {
+                Some(updated_at) if updated_at.as_str() >= gte.as_str() => {}
+                _ => return false,
+            }
+        }
+
+        // updated_at_lte: string comparison
+        if let Some(ref lte) = self.updated_at_lte {
+            match &record.updated_at {
+                Some(updated_at) if updated_at.as_str() <= lte.as_str() => {}
+                _ => return false,
+            }
+        }
+
+        true
+    }
+}
+
+/// Parse comma-separated tags into a set of lowercase trimmed strings
+pub fn parse_tags(tags: Option<&str>) -> HashSet<String> {
+    tags.map(|t| {
+        t.split(',')
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+#[derive(Debug, Clone)]
+pub struct SearchCommand {
+    pub text: Option<String>,
+    pub embedding: Option<Vec<f32>>,
+    pub k: Option<usize>,
+    pub ef: Option<usize>,
+    /// Weight for vector score in hybrid search (0.0 = BM25 only, 1.0 = vector only)
+    /// Default is 0.7
+    pub alpha: Option<f64>,
+    /// Optional filter to narrow down search results
+    pub filter: Option<SearchFilter>,
+}
+
+/// Information about the best matching chunk within a document
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChunkInfo {
+    /// Index of the chunk within the parent document
+    pub chunk_index: usize,
+    /// Preview of the chunk text (first ~100 chars)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text_preview: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SearchHit {
+    pub index_id: usize,
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub distance: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bm25_score: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hybrid_score: Option<f64>,
+    pub title: Option<String>,
+    pub source: Option<String>,
+    pub tags: Option<String>,
+    /// Best matching chunk info (only present when chunking is enabled)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub best_chunk: Option<ChunkInfo>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct InsertResult {
+    pub index_id: usize,
+    pub id: String,
+    pub dim: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DocumentSummary {
+    pub index_id: usize,
+    #[serde(flatten)]
+    pub record: Record,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DocumentResponse {
+    pub index_id: usize,
+    #[serde(flatten)]
+    pub record: Record,
+    pub embedding: Vec<f32>,
+}
+
+/// Internal enum representing the effect of an update operation
+pub(super) enum UpdateEffect {
+    /// Only metadata changed, no re-embedding needed
+    MetadataOnly,
+    /// Content changed, re-embedding required
+    ContentChanged { text: String },
+}
+
+/// Document indexing mode - determines how documents are stored and searched
+pub(super) enum IndexingMode {
+    /// Documents indexed as-is (no chunking)
+    Direct,
+    /// Documents split into chunks for finer-grained search
+    Chunked {
+        chunker: Box<dyn crate::domain::ports::Chunker>,
+        chunk_store: Box<dyn crate::domain::ports::ChunkStore>,
+        chunks: Vec<crate::domain::model::StoredChunk>,
+        /// Maps index ID -> (record_index, chunk_index within that record)
+        chunk_mapping: Vec<(usize, usize)>,
+    },
+}
+
+impl IndexingMode {
+    /// Returns true if chunking is enabled and has data
+    pub(super) fn is_chunked_with_data(&self) -> bool {
+        matches!(self, Self::Chunked { chunk_mapping, .. } if !chunk_mapping.is_empty())
+    }
+
+    /// Get chunks (empty slice for Direct mode)
+    pub(super) fn chunks(&self) -> &[crate::domain::model::StoredChunk] {
+        match self {
+            Self::Direct => &[],
+            Self::Chunked { chunks, .. } => chunks,
+        }
+    }
+
+    /// Get chunk mapping (empty slice for Direct mode)
+    pub(super) fn chunk_mapping(&self) -> &[(usize, usize)] {
+        match self {
+            Self::Direct => &[],
+            Self::Chunked { chunk_mapping, .. } => chunk_mapping,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_record(
+        id: &str,
+        source: Option<&str>,
+        tags: Option<&str>,
+        updated_at: Option<&str>,
+    ) -> Record {
+        Record {
+            id: id.to_string(),
+            title: Some("Test".to_string()),
+            body: None,
+            source: source.map(|s| s.to_string()),
+            updated_at: updated_at.map(|s| s.to_string()),
+            tags: tags.map(|s| s.to_string()),
+        }
+    }
+
+    #[test]
+    fn test_filter_empty_matches_all() {
+        let filter = SearchFilter::default();
+        let record = make_record("1", Some("news"), Some("ai, rust"), Some("2024-06-15"));
+        assert!(filter.matches(&record));
+    }
+
+    #[test]
+    fn test_filter_source_exact_match() {
+        let filter = SearchFilter {
+            source: Some("news".to_string()),
+            ..Default::default()
+        };
+        let record = make_record("1", Some("news"), None, None);
+        assert!(filter.matches(&record));
+
+        let record2 = make_record("2", Some("blog"), None, None);
+        assert!(!filter.matches(&record2));
+
+        let record3 = make_record("3", None, None, None);
+        assert!(!filter.matches(&record3));
+    }
+
+    #[test]
+    fn test_filter_tags_any() {
+        let filter = SearchFilter {
+            tags_any: Some(vec!["ai".to_string(), "ml".to_string()]),
+            ..Default::default()
+        };
+
+        // Has "ai" tag
+        let record1 = make_record("1", None, Some("ai, rust"), None);
+        assert!(filter.matches(&record1));
+
+        // Has "ml" tag
+        let record2 = make_record("2", None, Some("ml, python"), None);
+        assert!(filter.matches(&record2));
+
+        // Has neither
+        let record3 = make_record("3", None, Some("rust, go"), None);
+        assert!(!filter.matches(&record3));
+
+        // No tags at all
+        let record4 = make_record("4", None, None, None);
+        assert!(!filter.matches(&record4));
+    }
+
+    #[test]
+    fn test_filter_tags_all() {
+        let filter = SearchFilter {
+            tags_all: Some(vec!["ai".to_string(), "rust".to_string()]),
+            ..Default::default()
+        };
+
+        // Has both tags
+        let record1 = make_record("1", None, Some("ai, rust, news"), None);
+        assert!(filter.matches(&record1));
+
+        // Has only one
+        let record2 = make_record("2", None, Some("ai, python"), None);
+        assert!(!filter.matches(&record2));
+
+        // Has neither
+        let record3 = make_record("3", None, Some("go, python"), None);
+        assert!(!filter.matches(&record3));
+    }
+
+    #[test]
+    fn test_filter_tags_case_insensitive() {
+        let filter = SearchFilter {
+            tags_any: Some(vec!["AI".to_string(), "RUST".to_string()]),
+            ..Default::default()
+        };
+
+        let record = make_record("1", None, Some("ai, rust"), None);
+        assert!(filter.matches(&record));
+
+        let filter2 = SearchFilter {
+            tags_all: Some(vec!["AI".to_string()]),
+            ..Default::default()
+        };
+        assert!(filter2.matches(&record));
+    }
+
+    #[test]
+    fn test_filter_tags_with_whitespace() {
+        let filter = SearchFilter {
+            tags_any: Some(vec!["ai".to_string()]),
+            ..Default::default()
+        };
+
+        // Tags with extra whitespace
+        let record = make_record("1", None, Some("  ai  ,  rust  "), None);
+        assert!(filter.matches(&record));
+    }
+
+    #[test]
+    fn test_filter_updated_at_gte() {
+        let filter = SearchFilter {
+            updated_at_gte: Some("2024-06-01".to_string()),
+            ..Default::default()
+        };
+
+        let record1 = make_record("1", None, None, Some("2024-06-15"));
+        assert!(filter.matches(&record1));
+
+        let record2 = make_record("2", None, None, Some("2024-06-01"));
+        assert!(filter.matches(&record2));
+
+        let record3 = make_record("3", None, None, Some("2024-05-31"));
+        assert!(!filter.matches(&record3));
+
+        // No updated_at
+        let record4 = make_record("4", None, None, None);
+        assert!(!filter.matches(&record4));
+    }
+
+    #[test]
+    fn test_filter_updated_at_lte() {
+        let filter = SearchFilter {
+            updated_at_lte: Some("2024-06-30".to_string()),
+            ..Default::default()
+        };
+
+        let record1 = make_record("1", None, None, Some("2024-06-15"));
+        assert!(filter.matches(&record1));
+
+        let record2 = make_record("2", None, None, Some("2024-06-30"));
+        assert!(filter.matches(&record2));
+
+        let record3 = make_record("3", None, None, Some("2024-07-01"));
+        assert!(!filter.matches(&record3));
+    }
+
+    #[test]
+    fn test_filter_updated_at_range() {
+        let filter = SearchFilter {
+            updated_at_gte: Some("2024-01-01".to_string()),
+            updated_at_lte: Some("2024-12-31".to_string()),
+            ..Default::default()
+        };
+
+        let record1 = make_record("1", None, None, Some("2024-06-15"));
+        assert!(filter.matches(&record1));
+
+        let record2 = make_record("2", None, None, Some("2023-12-31"));
+        assert!(!filter.matches(&record2));
+
+        let record3 = make_record("3", None, None, Some("2025-01-01"));
+        assert!(!filter.matches(&record3));
+    }
+
+    #[test]
+    fn test_filter_combined() {
+        let filter = SearchFilter {
+            source: Some("news".to_string()),
+            tags_any: Some(vec!["ai".to_string(), "rust".to_string()]),
+            updated_at_gte: Some("2024-01-01".to_string()),
+            ..Default::default()
+        };
+
+        // All conditions match
+        let record1 = make_record("1", Some("news"), Some("ai, tech"), Some("2024-06-15"));
+        assert!(filter.matches(&record1));
+
+        // Wrong source
+        let record2 = make_record("2", Some("blog"), Some("ai, tech"), Some("2024-06-15"));
+        assert!(!filter.matches(&record2));
+
+        // No matching tags
+        let record3 = make_record("3", Some("news"), Some("go, python"), Some("2024-06-15"));
+        assert!(!filter.matches(&record3));
+
+        // Too old
+        let record4 = make_record("4", Some("news"), Some("ai, tech"), Some("2023-12-31"));
+        assert!(!filter.matches(&record4));
+    }
+
+    #[test]
+    fn test_parse_tags() {
+        let tags = parse_tags(Some("ai, rust, ML"));
+        assert!(tags.contains("ai"));
+        assert!(tags.contains("rust"));
+        assert!(tags.contains("ml"));
+        assert_eq!(tags.len(), 3);
+
+        let empty = parse_tags(None);
+        assert!(empty.is_empty());
+
+        let empty2 = parse_tags(Some(""));
+        assert!(empty2.is_empty());
+
+        let with_spaces = parse_tags(Some("  ai  ,  ,  rust  "));
+        assert!(with_spaces.contains("ai"));
+        assert!(with_spaces.contains("rust"));
+        assert_eq!(with_spaces.len(), 2);
+    }
+}
