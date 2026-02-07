@@ -1,8 +1,10 @@
 //! Type definitions for the document service.
 
-use crate::domain::model::{Record, Tag};
+use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+
+use crate::domain::model::{Record, Tag};
 
 /// Policy for tombstone-based compaction
 #[derive(Debug, Clone)]
@@ -156,38 +158,98 @@ pub struct UpdateCommand {
     pub title: Option<String>,
     pub body: Option<String>,
     pub source: Option<String>,
-    pub updated_at: Option<String>,
+    pub updated_at: Option<NaiveDate>,
     pub tags: Option<Vec<Tag>>,
     pub text: Option<String>,
 }
 
-/// Tag filter mode for SearchFilter
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(tag = "mode", rename_all = "snake_case")]
+/// Tag filter mode for SearchFilter (uses HashSet for O(1) matching)
+#[derive(Debug, Clone, Default)]
 pub enum TagFilter {
     /// No tag filtering
     #[default]
     None,
-    /// Match if any of these tags are present
-    Any(Vec<Tag>),
-    /// Match only if all of these tags are present
-    All(Vec<Tag>),
+    /// Match if any of these tags are present (O(1) per check)
+    Any(HashSet<Tag>),
+    /// Match only if all of these tags are present (O(n) where n = filter size)
+    All(HashSet<Tag>),
 }
 
 impl TagFilter {
-    /// Check if record tags match this filter
+    /// Check if record tags match this filter (O(1) per tag for Any, O(n) for All)
     fn matches(&self, record_tags: &[Tag]) -> bool {
-        let record_set: HashSet<&str> = record_tags.iter().map(Tag::as_str).collect();
         match self {
             Self::None => true,
-            Self::Any(filter_tags) => {
-                filter_tags.is_empty()
-                    || filter_tags.iter().any(|t| record_set.contains(t.as_str()))
+            Self::Any(filter_set) => {
+                filter_set.is_empty() || record_tags.iter().any(|t| filter_set.contains(t))
             }
-            Self::All(filter_tags) => {
-                filter_tags.is_empty()
-                    || filter_tags.iter().all(|t| record_set.contains(t.as_str()))
+            Self::All(filter_set) => {
+                filter_set.is_empty() || filter_set.iter().all(|t| record_tags.contains(t))
             }
+        }
+    }
+}
+
+// Custom serde for TagFilter to maintain JSON compatibility (array format)
+// Tags are sorted for deterministic output
+impl Serialize for TagFilter {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap;
+        match self {
+            Self::None => {
+                let mut map = serializer.serialize_map(Some(1))?;
+                map.serialize_entry("mode", "none")?;
+                map.end()
+            }
+            Self::Any(tags) => {
+                let mut map = serializer.serialize_map(Some(2))?;
+                map.serialize_entry("mode", "any")?;
+                // Sort for deterministic output
+                let mut vec: Vec<&Tag> = tags.iter().collect();
+                vec.sort_by_key(|t| t.as_str());
+                map.serialize_entry("tags", &vec)?;
+                map.end()
+            }
+            Self::All(tags) => {
+                let mut map = serializer.serialize_map(Some(2))?;
+                map.serialize_entry("mode", "all")?;
+                // Sort for deterministic output
+                let mut vec: Vec<&Tag> = tags.iter().collect();
+                vec.sort_by_key(|t| t.as_str());
+                map.serialize_entry("tags", &vec)?;
+                map.end()
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for TagFilter {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct TagFilterRaw {
+            mode: Option<String>,
+            tags: Option<Vec<Tag>>,
+        }
+
+        let raw = TagFilterRaw::deserialize(deserializer)?;
+        match raw.mode.as_deref() {
+            None | Some("none") => Ok(Self::None),
+            Some("any") => Ok(Self::Any(
+                raw.tags.unwrap_or_default().into_iter().collect(),
+            )),
+            Some("all") => Ok(Self::All(
+                raw.tags.unwrap_or_default().into_iter().collect(),
+            )),
+            Some(other) => Err(serde::de::Error::custom(format!(
+                "unknown tag filter mode: {}",
+                other
+            ))),
         }
     }
 }
@@ -200,12 +262,12 @@ pub struct SearchFilter {
     /// Tag filter (none, any, or all)
     #[serde(default, flatten)]
     pub tag_filter: TagFilter,
-    /// Match if updated_at >= this value (string comparison, YYYY-MM-DD)
+    /// Match if updated_at >= this value (YYYY-MM-DD format in JSON)
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub updated_at_gte: Option<String>,
-    /// Match if updated_at <= this value (string comparison, YYYY-MM-DD)
+    pub updated_at_gte: Option<NaiveDate>,
+    /// Match if updated_at <= this value (YYYY-MM-DD format in JSON)
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub updated_at_lte: Option<String>,
+    pub updated_at_lte: Option<NaiveDate>,
 }
 
 impl SearchFilter {
@@ -224,18 +286,18 @@ impl SearchFilter {
             return false;
         }
 
-        // updated_at_gte
-        if let Some(ref gte) = self.updated_at_gte {
-            match &record.updated_at {
-                Some(updated_at) if updated_at.as_str() >= gte.as_str() => {}
+        // updated_at_gte (type-safe date comparison)
+        if let Some(gte) = self.updated_at_gte {
+            match record.updated_at {
+                Some(updated_at) if updated_at >= gte => {}
                 _ => return false,
             }
         }
 
-        // updated_at_lte
-        if let Some(ref lte) = self.updated_at_lte {
-            match &record.updated_at {
-                Some(updated_at) if updated_at.as_str() <= lte.as_str() => {}
+        // updated_at_lte (type-safe date comparison)
+        if let Some(lte) = self.updated_at_lte {
+            match record.updated_at {
+                Some(updated_at) if updated_at <= lte => {}
                 _ => return false,
             }
         }
@@ -499,6 +561,11 @@ pub(super) enum UpdateEffect {
     ContentChanged { text: String },
 }
 
+use std::collections::HashMap as StdHashMap;
+
+/// Key for chunk index: (parent_id, chunk_index)
+pub(super) type ChunkKey = (String, usize);
+
 /// Document indexing mode - determines how documents are stored and searched
 pub(super) enum IndexingMode {
     /// Documents indexed as-is (no chunking)
@@ -510,6 +577,8 @@ pub(super) enum IndexingMode {
         chunks: Vec<crate::domain::model::StoredChunk>,
         /// Maps index ID -> (record_index, chunk_index within that record)
         chunk_mapping: Vec<(usize, usize)>,
+        /// O(1) index: (parent_id, chunk_index) -> chunk position in chunks vec
+        chunk_index: StdHashMap<ChunkKey, usize>,
     },
 }
 
@@ -534,11 +603,34 @@ impl IndexingMode {
             Self::Chunked { chunk_mapping, .. } => chunk_mapping,
         }
     }
+
+    /// Get chunk by (parent_id, chunk_index) in O(1)
+    pub(super) fn get_chunk(
+        &self,
+        parent_id: &str,
+        chunk_idx: usize,
+    ) -> Option<&crate::domain::model::StoredChunk> {
+        match self {
+            Self::Direct => None,
+            Self::Chunked {
+                chunks,
+                chunk_index,
+                ..
+            } => {
+                let key = (parent_id.to_string(), chunk_idx);
+                chunk_index.get(&key).and_then(|&pos| chunks.get(pos))
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parse_date(s: &str) -> NaiveDate {
+        NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap()
+    }
 
     fn make_record(
         id: &str,
@@ -551,9 +643,13 @@ mod tests {
             title: Some("Test".to_string()),
             body: None,
             source: source.map(|s| s.to_string()),
-            updated_at: updated_at.map(|s| s.to_string()),
+            updated_at: updated_at.map(parse_date),
             tags: tags.map(Tag::parse_many).unwrap_or_default(),
         }
+    }
+
+    fn tags_set(tags: &[&str]) -> HashSet<Tag> {
+        tags.iter().map(|s| Tag::new(*s)).collect()
     }
 
     #[test]
@@ -582,7 +678,7 @@ mod tests {
     #[test]
     fn test_filter_tags_any() {
         let filter = SearchFilter {
-            tag_filter: TagFilter::Any(vec![Tag::new("ai"), Tag::new("ml")]),
+            tag_filter: TagFilter::Any(tags_set(&["ai", "ml"])),
             ..Default::default()
         };
 
@@ -606,7 +702,7 @@ mod tests {
     #[test]
     fn test_filter_tags_all() {
         let filter = SearchFilter {
-            tag_filter: TagFilter::All(vec![Tag::new("ai"), Tag::new("rust")]),
+            tag_filter: TagFilter::All(tags_set(&["ai", "rust"])),
             ..Default::default()
         };
 
@@ -626,7 +722,7 @@ mod tests {
     #[test]
     fn test_filter_tags_case_insensitive() {
         let filter = SearchFilter {
-            tag_filter: TagFilter::Any(vec![Tag::new("AI"), Tag::new("RUST")]),
+            tag_filter: TagFilter::Any(tags_set(&["AI", "RUST"])),
             ..Default::default()
         };
 
@@ -634,7 +730,7 @@ mod tests {
         assert!(filter.matches(&record));
 
         let filter2 = SearchFilter {
-            tag_filter: TagFilter::All(vec![Tag::new("AI")]),
+            tag_filter: TagFilter::All(tags_set(&["AI"])),
             ..Default::default()
         };
         assert!(filter2.matches(&record));
@@ -643,7 +739,7 @@ mod tests {
     #[test]
     fn test_filter_tags_with_whitespace() {
         let filter = SearchFilter {
-            tag_filter: TagFilter::Any(vec![Tag::new("ai")]),
+            tag_filter: TagFilter::Any(tags_set(&["ai"])),
             ..Default::default()
         };
 
@@ -655,7 +751,7 @@ mod tests {
     #[test]
     fn test_filter_updated_at_gte() {
         let filter = SearchFilter {
-            updated_at_gte: Some("2024-06-01".to_string()),
+            updated_at_gte: Some(parse_date("2024-06-01")),
             ..Default::default()
         };
 
@@ -676,7 +772,7 @@ mod tests {
     #[test]
     fn test_filter_updated_at_lte() {
         let filter = SearchFilter {
-            updated_at_lte: Some("2024-06-30".to_string()),
+            updated_at_lte: Some(parse_date("2024-06-30")),
             ..Default::default()
         };
 
@@ -693,8 +789,8 @@ mod tests {
     #[test]
     fn test_filter_updated_at_range() {
         let filter = SearchFilter {
-            updated_at_gte: Some("2024-01-01".to_string()),
-            updated_at_lte: Some("2024-12-31".to_string()),
+            updated_at_gte: Some(parse_date("2024-01-01")),
+            updated_at_lte: Some(parse_date("2024-12-31")),
             ..Default::default()
         };
 
@@ -712,8 +808,8 @@ mod tests {
     fn test_filter_combined() {
         let filter = SearchFilter {
             source: Some("news".to_string()),
-            tag_filter: TagFilter::Any(vec![Tag::new("ai"), Tag::new("rust")]),
-            updated_at_gte: Some("2024-01-01".to_string()),
+            tag_filter: TagFilter::Any(tags_set(&["ai", "rust"])),
+            updated_at_gte: Some(parse_date("2024-01-01")),
             ..Default::default()
         };
 

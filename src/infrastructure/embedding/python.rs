@@ -53,10 +53,10 @@ impl Embedder for PythonEmbedder {
         let output = child.wait_with_output()?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("embedding failed: {}", stderr.trim()),
-            ));
+            return Err(io::Error::other(format!(
+                "embedding failed: {}",
+                stderr.trim()
+            )));
         }
 
         let response: EmbedResponse = serde_json::from_slice(&output.stdout)

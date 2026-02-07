@@ -1,3 +1,4 @@
+use chrono::NaiveDate;
 use serde::{Deserialize, Deserializer, Serialize};
 
 /// A normalized tag (lowercase, trimmed)
@@ -87,10 +88,108 @@ pub struct Record {
     pub title: Option<String>,
     pub body: Option<String>,
     pub source: Option<String>,
-    pub updated_at: Option<String>,
+    /// Date when the record was last updated (YYYY-MM-DD format in JSON)
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "optional_naive_date"
+    )]
+    pub updated_at: Option<NaiveDate>,
     /// Tags associated with this record (normalized to lowercase)
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Supports both old format ("tag1, tag2") and new format (["tag1", "tag2"])
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_tags_compat"
+    )]
     pub tags: Vec<Tag>,
+}
+
+/// Deserialize tags with backward compatibility for old comma-separated string format
+fn deserialize_tags_compat<'de, D>(deserializer: D) -> Result<Vec<Tag>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use serde::de::{self, SeqAccess, Visitor};
+    use std::fmt;
+
+    struct TagsVisitor;
+
+    impl<'de> Visitor<'de> for TagsVisitor {
+        type Value = Vec<Tag>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            formatter.write_str("a string of comma-separated tags or an array of tags")
+        }
+
+        // Old format: "tag1, tag2, tag3"
+        fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(Tag::parse_many(v))
+        }
+
+        // New format: ["tag1", "tag2", "tag3"]
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let mut tags = Vec::new();
+            while let Some(tag) = seq.next_element::<Tag>()? {
+                tags.push(tag);
+            }
+            Ok(tags)
+        }
+
+        // Handle null
+        fn visit_unit<E>(self) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(Vec::new())
+        }
+
+        fn visit_none<E>(self) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(Vec::new())
+        }
+    }
+
+    deserializer.deserialize_any(TagsVisitor)
+}
+
+/// Custom serde module for Option<NaiveDate> with YYYY-MM-DD format
+mod optional_naive_date {
+    use chrono::NaiveDate;
+    use serde::{self, Deserialize, Deserializer, Serializer};
+
+    const FORMAT: &str = "%Y-%m-%d";
+
+    pub fn serialize<S>(date: &Option<NaiveDate>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match date {
+            Some(d) => serializer.serialize_str(&d.format(FORMAT).to_string()),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<NaiveDate>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let opt: Option<String> = Option::deserialize(deserializer)?;
+        match opt {
+            Some(s) => NaiveDate::parse_from_str(&s, FORMAT)
+                .map(Some)
+                .map_err(serde::de::Error::custom),
+            None => Ok(None),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -118,5 +217,57 @@ impl StoredRecord {
             embedding,
             deleted,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_tags_deserialize_new_format_array() {
+        let json = r#"{"id":"1","tags":["ai","rust"]}"#;
+        let record: Record = serde_json::from_str(json).unwrap();
+        assert_eq!(record.tags.len(), 2);
+        assert_eq!(record.tags[0].as_str(), "ai");
+        assert_eq!(record.tags[1].as_str(), "rust");
+    }
+
+    #[test]
+    fn test_tags_deserialize_old_format_string() {
+        let json = r#"{"id":"1","tags":"ai, rust, ML"}"#;
+        let record: Record = serde_json::from_str(json).unwrap();
+        assert_eq!(record.tags.len(), 3);
+        assert_eq!(record.tags[0].as_str(), "ai");
+        assert_eq!(record.tags[1].as_str(), "rust");
+        assert_eq!(record.tags[2].as_str(), "ml"); // normalized to lowercase
+    }
+
+    #[test]
+    fn test_tags_deserialize_null() {
+        let json = r#"{"id":"1","tags":null}"#;
+        let record: Record = serde_json::from_str(json).unwrap();
+        assert!(record.tags.is_empty());
+    }
+
+    #[test]
+    fn test_tags_deserialize_missing() {
+        let json = r#"{"id":"1"}"#;
+        let record: Record = serde_json::from_str(json).unwrap();
+        assert!(record.tags.is_empty());
+    }
+
+    #[test]
+    fn test_tags_serialize_outputs_array() {
+        let record = Record {
+            id: "1".to_string(),
+            title: None,
+            body: None,
+            source: None,
+            updated_at: None,
+            tags: vec![Tag::new("ai"), Tag::new("rust")],
+        };
+        let json = serde_json::to_string(&record).unwrap();
+        assert!(json.contains(r#""tags":["ai","rust"]"#));
     }
 }

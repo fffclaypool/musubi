@@ -208,13 +208,13 @@ impl Chunker for SemanticChunker {
                 let mut current_len = 0;
                 let mut segment_start = chunk_start_idx;
 
-                for i in chunk_start_idx..sentences.len() {
-                    current_len += sentences[i].0.len() + 1; // +1 for space
+                for (i, (sentence, _, _)) in sentences.iter().enumerate().skip(chunk_start_idx) {
+                    current_len += sentence.len() + 1; // +1 for space
                     if current_len > self.max_chunk_size && i > segment_start {
                         chunks.push(build_chunk(segment_start, i, chunk_index));
                         chunk_index += 1;
                         segment_start = i;
-                        current_len = sentences[i].0.len();
+                        current_len = sentence.len();
                     }
                 }
                 end_idx = sentences.len();

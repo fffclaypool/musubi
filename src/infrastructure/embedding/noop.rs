@@ -2,7 +2,7 @@ use crate::domain::ports::Embedder;
 use crate::domain::types::Vector;
 use std::io;
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct NoopEmbedder;
 
 impl NoopEmbedder {
@@ -13,8 +13,7 @@ impl NoopEmbedder {
 
 impl Embedder for NoopEmbedder {
     fn embed(&self, _texts: Vec<String>) -> io::Result<Vec<Vector>> {
-        Err(io::Error::new(
-            io::ErrorKind::Other,
+        Err(io::Error::other(
             "embedder is not configured for this command",
         ))
     }

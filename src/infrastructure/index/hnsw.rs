@@ -31,6 +31,12 @@ pub struct HnswIndex {
     pub(crate) max_level: usize,
 }
 
+impl Default for HnswIndex {
+    fn default() -> Self {
+        Self::new(16, 200)
+    }
+}
+
 impl HnswIndex {
     /// 新しいHNSWインデックスを作成する
     ///
@@ -51,11 +57,6 @@ impl HnswIndex {
             level_mult: 1.0 / (m as f64).ln(),
             max_level: 0,
         }
-    }
-
-    /// デフォルトパラメータで新しいHNSWインデックスを作成する
-    pub fn default() -> Self {
-        Self::new(16, 200)
     }
 
     /// インデックス内のベクトル数を取得する

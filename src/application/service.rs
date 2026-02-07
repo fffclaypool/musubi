@@ -17,6 +17,7 @@ mod core;
 mod load;
 mod read;
 mod search;
+mod traits;
 mod types;
 mod util;
 mod write;
@@ -37,3 +38,6 @@ pub use crate::domain::model::Tag;
 
 // Re-export the main service struct
 pub use core::DocumentService;
+
+// Re-export traits for trait-based polymorphism
+pub use traits::{DocumentRead, DocumentSearch, DocumentWrite};

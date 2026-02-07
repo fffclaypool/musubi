@@ -37,6 +37,7 @@ impl DocumentService {
                 chunks,
                 chunk_store,
                 chunk_mapping,
+                chunk_index,
                 ..
             } if !chunks.is_empty() => {
                 // Chunking mode: rebuild from chunks
@@ -49,6 +50,12 @@ impl DocumentService {
 
                 // Rebuild chunk_mapping
                 *chunk_mapping = build_chunk_mapping(chunks, &self.records);
+
+                // Rebuild chunk_index (positions changed after retain)
+                chunk_index.clear();
+                for (pos, chunk) in chunks.iter().enumerate() {
+                    chunk_index.insert((chunk.parent_id.clone(), chunk.chunk.chunk_index), pos);
+                }
 
                 // Save chunks
                 chunk_store.save_all(chunks)?;

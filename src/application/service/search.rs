@@ -5,10 +5,14 @@ use std::collections::{HashMap, HashSet};
 use crate::application::error::AppError;
 
 use super::core::DocumentService;
+use super::traits::DocumentSearch;
 use super::types::{
     ChunkInfo, ScoreBreakdown, SearchHit, SearchInput, SearchMode, ValidatedSearchQuery,
 };
 use super::util::create_text_preview;
+
+/// Vector search result: (record_idx -> distance, record_idx -> (chunk_idx, distance))
+type VectorSearchResult = (HashMap<usize, f32>, HashMap<usize, (usize, f32)>);
 
 /// Normalization factors for hybrid scoring
 struct Normalization {
@@ -23,12 +27,8 @@ struct ScoredCandidate {
     score: ScoreBreakdown,
 }
 
-impl DocumentService {
-    /// Search for documents matching the validated query.
-    ///
-    /// The query has already been validated at construction time, so this method
-    /// can focus on the search logic without defensive checks.
-    pub fn search(&self, query: ValidatedSearchQuery) -> Result<Vec<SearchHit>, AppError> {
+impl DocumentSearch for DocumentService {
+    fn search(&self, query: ValidatedSearchQuery) -> Result<Vec<SearchHit>, AppError> {
         let k = query.params.k;
         let mode = query.params.mode;
         let search_k = (k * 4).max(100);
@@ -56,7 +56,10 @@ impl DocumentService {
 
         Ok(hits)
     }
+}
 
+// Private helper methods for search operations
+impl DocumentService {
     /// Execute vector search based on input and mode
     fn execute_vector_search(
         &self,
@@ -65,7 +68,7 @@ impl DocumentService {
         search_k: usize,
         search_ef: usize,
         chunking_enabled: bool,
-    ) -> Result<(HashMap<usize, f32>, HashMap<usize, (usize, f32)>), AppError> {
+    ) -> Result<VectorSearchResult, AppError> {
         if !mode.needs_vector() {
             return Ok((HashMap::new(), HashMap::new()));
         }
@@ -220,7 +223,7 @@ impl DocumentService {
             .filter(|&record_idx| {
                 self.records
                     .get(record_idx)
-                    .is_some_and(|r| !r.deleted && filter.map_or(true, |f| f.matches(&r.record)))
+                    .is_some_and(|r| !r.deleted && filter.is_none_or(|f| f.matches(&r.record)))
             })
             .collect()
     }
@@ -271,14 +274,10 @@ impl DocumentService {
                     chunk_info_map
                         .get(&candidate.record_idx)
                         .map(|&(chunk_idx, _)| {
+                            // O(1) chunk lookup via chunk_index
                             let text_preview = self
                                 .indexing_mode
-                                .chunks()
-                                .iter()
-                                .find(|c| {
-                                    c.parent_id == record.record.id
-                                        && c.chunk.chunk_index == chunk_idx
-                                })
+                                .get_chunk(&record.record.id, chunk_idx)
                                 .map(|c| create_text_preview(&c.chunk.text, 100));
 
                             ChunkInfo {
