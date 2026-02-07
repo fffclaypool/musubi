@@ -28,8 +28,8 @@ mod tests;
 pub use types::{
     ChunkConfig, ChunkInfo, DocumentResponse, DocumentSummary, InsertCommand, InsertResult,
     SearchFilter, SearchHit, SearchInput, SearchMode, SearchParams, SearchRequest,
-    SearchValidationError, ServiceConfig, TombstoneConfig, TombstonePolicy, UpdateCommand,
-    ValidatedSearchQuery,
+    SearchValidationError, ServiceConfig, TagFilter, TombstoneConfig, TombstonePolicy,
+    UpdateCommand, ValidatedSearchQuery,
 };
 
 // Re-export the main service struct
