@@ -27,8 +27,9 @@ mod tests;
 // Re-export public types
 pub use types::{
     ChunkConfig, ChunkInfo, DocumentResponse, DocumentSummary, InsertCommand, InsertResult,
-    SearchCommand, SearchFilter, SearchHit, SearchMode, ServiceConfig, TombstoneConfig,
-    TombstonePolicy, UpdateCommand,
+    SearchFilter, SearchHit, SearchInput, SearchMode, SearchParams, SearchRequest,
+    SearchValidationError, ServiceConfig, TombstoneConfig, TombstonePolicy, UpdateCommand,
+    ValidatedSearchQuery,
 };
 
 // Re-export the main service struct

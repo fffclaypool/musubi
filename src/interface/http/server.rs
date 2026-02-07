@@ -1,7 +1,7 @@
 use crate::application::error::AppError;
 use crate::application::service::{
-    DocumentResponse, DocumentService, DocumentSummary, InsertCommand, InsertResult, SearchCommand,
-    SearchFilter, SearchHit, UpdateCommand,
+    DocumentResponse, DocumentService, DocumentSummary, InsertCommand, InsertResult, SearchHit,
+    SearchRequest, SearchValidationError, UpdateCommand, ValidatedSearchQuery,
 };
 use crate::domain::model::Record;
 use axum::{
@@ -45,18 +45,6 @@ struct UpdateRequest {
 #[derive(Debug, Deserialize)]
 struct EmbedRequest {
     texts: Vec<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct SearchRequest {
-    text: Option<String>,
-    embedding: Option<Vec<f32>>,
-    k: Option<usize>,
-    ef: Option<usize>,
-    /// Weight for vector score in hybrid search (0.0 = BM25 only, 1.0 = vector only)
-    alpha: Option<f64>,
-    /// Optional metadata filter
-    filter: Option<SearchFilter>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -106,6 +94,15 @@ impl From<AppError> for ApiError {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
                 message,
             },
+        }
+    }
+}
+
+impl From<SearchValidationError> for ApiError {
+    fn from(err: SearchValidationError) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            message: err.to_string(),
         }
     }
 }
@@ -198,19 +195,12 @@ async fn search_handler(
     State(state): State<AppState>,
     Json(req): Json<SearchRequest>,
 ) -> Result<Json<SearchResponse>, ApiError> {
-    let cmd = SearchCommand {
-        text: req.text,
-        embedding: req.embedding,
-        k: req.k,
-        ef: req.ef,
-        alpha: req.alpha,
-        filter: req.filter,
-    };
-
     let state = state.clone();
     let results = tokio::task::spawn_blocking(move || {
         let guard = state.service.blocking_read();
-        guard.search(cmd).map_err(ApiError::from)
+        // Validate the request using service's default values
+        let query = ValidatedSearchQuery::from_request(req, guard.default_k(), guard.default_ef())?;
+        guard.search(query).map_err(ApiError::from)
     })
     .await
     .map_err(|err| ApiError {

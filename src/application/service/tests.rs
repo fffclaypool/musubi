@@ -3,8 +3,8 @@
 #[cfg(test)]
 mod integration_tests {
     use crate::application::service::{
-        ChunkConfig, DocumentService, InsertCommand, SearchCommand, ServiceConfig, TombstoneConfig,
-        UpdateCommand,
+        ChunkConfig, DocumentService, InsertCommand, SearchRequest, ServiceConfig, TombstoneConfig,
+        UpdateCommand, ValidatedSearchQuery,
     };
     use crate::domain::model::{Chunk, Record, StoredChunk, StoredRecord};
     use crate::domain::ports::{
@@ -336,16 +336,18 @@ mod integration_tests {
         );
 
         // Verify search works
-        let results = service
-            .search(SearchCommand {
+        let query = ValidatedSearchQuery::from_request(
+            SearchRequest {
                 text: Some("document".to_string()),
-                embedding: None,
-                k: Some(5),
-                ef: None,
                 alpha: Some(1.0), // Vector only
-                filter: None,
-            })
-            .expect("Search failed");
+                k: Some(5),
+                ..Default::default()
+            },
+            service.default_k(),
+            service.default_ef(),
+        )
+        .expect("Validation failed");
+        let results = service.search(query).expect("Search failed");
 
         assert!(
             !results.is_empty(),
@@ -406,16 +408,18 @@ mod integration_tests {
         );
 
         // Verify search returns results with chunk info
-        let search_results = service
-            .search(SearchCommand {
+        let query = ValidatedSearchQuery::from_request(
+            SearchRequest {
                 text: Some("test document".to_string()),
-                embedding: None,
-                k: Some(5),
-                ef: None,
                 alpha: Some(1.0),
-                filter: None,
-            })
-            .expect("Search failed");
+                k: Some(5),
+                ..Default::default()
+            },
+            service.default_k(),
+            service.default_ef(),
+        )
+        .expect("Validation failed");
+        let search_results = service.search(query).expect("Search failed");
 
         assert!(!search_results.is_empty(), "Search should return results");
         assert!(
@@ -556,16 +560,18 @@ mod integration_tests {
         );
 
         // Search should not return deleted document
-        let results = service
-            .search(SearchCommand {
+        let query = ValidatedSearchQuery::from_request(
+            SearchRequest {
                 text: Some("test content".to_string()),
-                embedding: None,
-                k: Some(5),
-                ef: None,
                 alpha: Some(1.0),
-                filter: None,
-            })
-            .expect("Search failed");
+                k: Some(5),
+                ..Default::default()
+            },
+            service.default_k(),
+            service.default_ef(),
+        )
+        .expect("Validation failed");
+        let results = service.search(query).expect("Search failed");
 
         let doc1_in_results = results.iter().any(|r| r.id == "doc1");
         assert!(
