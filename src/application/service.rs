@@ -32,5 +32,8 @@ pub use types::{
     UpdateCommand, ValidatedSearchQuery,
 };
 
+// Re-export Tag from domain
+pub use crate::domain::model::Tag;
+
 // Re-export the main service struct
 pub use core::DocumentService;

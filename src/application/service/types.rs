@@ -1,6 +1,6 @@
 //! Type definitions for the document service.
 
-use crate::domain::model::Record;
+use crate::domain::model::{Record, Tag};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
@@ -157,7 +157,7 @@ pub struct UpdateCommand {
     pub body: Option<String>,
     pub source: Option<String>,
     pub updated_at: Option<String>,
-    pub tags: Option<String>,
+    pub tags: Option<Vec<Tag>>,
     pub text: Option<String>,
 }
 
@@ -169,27 +169,24 @@ pub enum TagFilter {
     #[default]
     None,
     /// Match if any of these tags are present
-    Any(Vec<String>),
+    Any(Vec<Tag>),
     /// Match only if all of these tags are present
-    All(Vec<String>),
+    All(Vec<Tag>),
 }
 
 impl TagFilter {
     /// Check if record tags match this filter
-    fn matches(&self, record_tags: &HashSet<String>) -> bool {
+    fn matches(&self, record_tags: &[Tag]) -> bool {
+        let record_set: HashSet<&str> = record_tags.iter().map(Tag::as_str).collect();
         match self {
             Self::None => true,
             Self::Any(filter_tags) => {
                 filter_tags.is_empty()
-                    || filter_tags
-                        .iter()
-                        .any(|t| record_tags.contains(&t.trim().to_lowercase()))
+                    || filter_tags.iter().any(|t| record_set.contains(t.as_str()))
             }
             Self::All(filter_tags) => {
                 filter_tags.is_empty()
-                    || filter_tags
-                        .iter()
-                        .all(|t| record_tags.contains(&t.trim().to_lowercase()))
+                    || filter_tags.iter().all(|t| record_set.contains(t.as_str()))
             }
         }
     }
@@ -223,8 +220,7 @@ impl SearchFilter {
         }
 
         // tag filter
-        let record_tags = parse_tags(record.tags.as_deref());
-        if !self.tag_filter.matches(&record_tags) {
+        if !self.tag_filter.matches(&record.tags) {
             return false;
         }
 
@@ -246,17 +242,6 @@ impl SearchFilter {
 
         true
     }
-}
-
-/// Parse comma-separated tags into a set of lowercase trimmed strings
-pub fn parse_tags(tags: Option<&str>) -> HashSet<String> {
-    tags.map(|t| {
-        t.split(',')
-            .map(|s| s.trim().to_lowercase())
-            .filter(|s| !s.is_empty())
-            .collect()
-    })
-    .unwrap_or_default()
 }
 
 /// Search input - validated query content
@@ -477,7 +462,8 @@ pub struct SearchHit {
     pub score: ScoreBreakdown,
     pub title: Option<String>,
     pub source: Option<String>,
-    pub tags: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<Tag>,
     /// Best matching chunk info (only present when chunking is enabled)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub best_chunk: Option<ChunkInfo>,
@@ -566,7 +552,7 @@ mod tests {
             body: None,
             source: source.map(|s| s.to_string()),
             updated_at: updated_at.map(|s| s.to_string()),
-            tags: tags.map(|s| s.to_string()),
+            tags: tags.map(Tag::parse_many).unwrap_or_default(),
         }
     }
 
@@ -596,7 +582,7 @@ mod tests {
     #[test]
     fn test_filter_tags_any() {
         let filter = SearchFilter {
-            tag_filter: TagFilter::Any(vec!["ai".to_string(), "ml".to_string()]),
+            tag_filter: TagFilter::Any(vec![Tag::new("ai"), Tag::new("ml")]),
             ..Default::default()
         };
 
@@ -620,7 +606,7 @@ mod tests {
     #[test]
     fn test_filter_tags_all() {
         let filter = SearchFilter {
-            tag_filter: TagFilter::All(vec!["ai".to_string(), "rust".to_string()]),
+            tag_filter: TagFilter::All(vec![Tag::new("ai"), Tag::new("rust")]),
             ..Default::default()
         };
 
@@ -640,7 +626,7 @@ mod tests {
     #[test]
     fn test_filter_tags_case_insensitive() {
         let filter = SearchFilter {
-            tag_filter: TagFilter::Any(vec!["AI".to_string(), "RUST".to_string()]),
+            tag_filter: TagFilter::Any(vec![Tag::new("AI"), Tag::new("RUST")]),
             ..Default::default()
         };
 
@@ -648,7 +634,7 @@ mod tests {
         assert!(filter.matches(&record));
 
         let filter2 = SearchFilter {
-            tag_filter: TagFilter::All(vec!["AI".to_string()]),
+            tag_filter: TagFilter::All(vec![Tag::new("AI")]),
             ..Default::default()
         };
         assert!(filter2.matches(&record));
@@ -657,7 +643,7 @@ mod tests {
     #[test]
     fn test_filter_tags_with_whitespace() {
         let filter = SearchFilter {
-            tag_filter: TagFilter::Any(vec!["ai".to_string()]),
+            tag_filter: TagFilter::Any(vec![Tag::new("ai")]),
             ..Default::default()
         };
 
@@ -726,7 +712,7 @@ mod tests {
     fn test_filter_combined() {
         let filter = SearchFilter {
             source: Some("news".to_string()),
-            tag_filter: TagFilter::Any(vec!["ai".to_string(), "rust".to_string()]),
+            tag_filter: TagFilter::Any(vec![Tag::new("ai"), Tag::new("rust")]),
             updated_at_gte: Some("2024-01-01".to_string()),
             ..Default::default()
         };
@@ -749,22 +735,19 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_tags() {
-        let tags = parse_tags(Some("ai, rust, ML"));
-        assert!(tags.contains("ai"));
-        assert!(tags.contains("rust"));
-        assert!(tags.contains("ml"));
+    fn test_tag_parse_many() {
+        let tags = Tag::parse_many("ai, rust, ML");
         assert_eq!(tags.len(), 3);
+        assert_eq!(tags[0].as_str(), "ai");
+        assert_eq!(tags[1].as_str(), "rust");
+        assert_eq!(tags[2].as_str(), "ml"); // normalized to lowercase
 
-        let empty = parse_tags(None);
+        let empty = Tag::parse_many("");
         assert!(empty.is_empty());
 
-        let empty2 = parse_tags(Some(""));
-        assert!(empty2.is_empty());
-
-        let with_spaces = parse_tags(Some("  ai  ,  ,  rust  "));
-        assert!(with_spaces.contains("ai"));
-        assert!(with_spaces.contains("rust"));
+        let with_spaces = Tag::parse_many("  ai  ,  ,  rust  ");
         assert_eq!(with_spaces.len(), 2);
+        assert_eq!(with_spaces[0].as_str(), "ai");
+        assert_eq!(with_spaces[1].as_str(), "rust");
     }
 }

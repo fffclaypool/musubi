@@ -78,7 +78,7 @@ pub(super) fn chunks_to_fake_records(chunks: &[StoredChunk]) -> Vec<StoredRecord
                     body: None,
                     source: None,
                     updated_at: None,
-                    tags: None,
+                    tags: Vec::new(),
                 },
                 c.embedding.clone(),
                 c.deleted,
