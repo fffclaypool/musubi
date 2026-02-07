@@ -5,8 +5,17 @@ use std::collections::{HashMap, HashSet};
 use crate::application::error::AppError;
 
 use super::core::DocumentService;
-use super::types::{ChunkInfo, SearchHit, SearchInput, SearchMode, ValidatedSearchQuery};
+use super::types::{
+    ChunkInfo, ScoreBreakdown, SearchHit, SearchInput, SearchMode, ValidatedSearchQuery,
+};
 use super::util::create_text_preview;
+
+/// Normalization factors for hybrid scoring
+struct Normalization {
+    max_bm25: f64,
+    min_distance: f32,
+    max_distance: f32,
+}
 
 impl DocumentService {
     /// Search for documents matching the validated query.
@@ -176,10 +185,8 @@ impl DocumentService {
                 .collect(),
         };
 
-        // Compute normalization factors
-        let max_bm25 = bm25_scores.values().cloned().fold(0.0f64, f64::max);
-        let min_distance = vector_scores.values().cloned().fold(f32::MAX, f32::min);
-        let max_distance = vector_scores.values().cloned().fold(0.0f32, f32::max);
+        // Compute normalization factors for hybrid scoring
+        let normalization = self.compute_normalization(&vector_scores, &bm25_scores);
 
         let mut hits: Vec<SearchHit> = all_candidates
             .into_iter()
@@ -199,31 +206,8 @@ impl DocumentService {
                 let distance = vector_scores.get(&record_idx).copied();
                 let bm25_raw = bm25_scores.get(&record_idx).copied();
 
-                // Normalize vector score (convert distance to similarity)
-                let vector_score = distance.map_or(0.0, |d| {
-                    if max_distance > min_distance {
-                        1.0 - ((d - min_distance) / (max_distance - min_distance)) as f64
-                    } else {
-                        1.0 - d as f64
-                    }
-                });
-
-                // Normalize BM25 score to [0, 1]
-                let bm25_score =
-                    bm25_raw.map_or(
-                        0.0,
-                        |bm25| {
-                            if max_bm25 > 0.0 {
-                                bm25 / max_bm25
-                            } else {
-                                0.0
-                            }
-                        },
-                    );
-
-                // Compute hybrid score
-                let alpha = mode.alpha();
-                let hybrid_score = alpha * vector_score + (1.0 - alpha) * bm25_score;
+                // Build ScoreBreakdown based on search mode
+                let score = self.build_score_breakdown(mode, distance, bm25_raw, &normalization)?;
 
                 // Build chunk info if chunking is enabled
                 let best_chunk = if chunking_enabled {
@@ -249,9 +233,7 @@ impl DocumentService {
                 Some(SearchHit {
                     index_id: record_idx,
                     id: record.record.id.clone(),
-                    distance,
-                    bm25_score: bm25_raw,
-                    hybrid_score: Some(hybrid_score),
+                    score,
                     title: record.record.title.clone(),
                     source: record.record.source.clone(),
                     tags: record.record.tags.clone(),
@@ -260,14 +242,80 @@ impl DocumentService {
             })
             .collect();
 
-        // Sort by hybrid score descending and truncate
+        // Sort by ranking score descending and truncate
         hits.sort_by(|a, b| {
-            b.hybrid_score
-                .partial_cmp(&a.hybrid_score)
+            b.score
+                .ranking_score()
+                .partial_cmp(&a.score.ranking_score())
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
         hits.truncate(k);
 
         hits
+    }
+
+    /// Compute normalization factors for hybrid scoring
+    fn compute_normalization(
+        &self,
+        vector_scores: &HashMap<usize, f32>,
+        bm25_scores: &HashMap<usize, f64>,
+    ) -> Normalization {
+        Normalization {
+            max_bm25: bm25_scores.values().cloned().fold(0.0f64, f64::max),
+            min_distance: vector_scores.values().cloned().fold(f32::MAX, f32::min),
+            max_distance: vector_scores.values().cloned().fold(0.0f32, f32::max),
+        }
+    }
+
+    /// Build ScoreBreakdown based on search mode and available scores
+    fn build_score_breakdown(
+        &self,
+        mode: SearchMode,
+        distance: Option<f32>,
+        bm25_raw: Option<f64>,
+        normalization: &Normalization,
+    ) -> Option<ScoreBreakdown> {
+        match mode {
+            SearchMode::VectorOnly => {
+                // VectorOnly requires distance
+                let distance = distance?;
+                Some(ScoreBreakdown::VectorOnly { distance })
+            }
+            SearchMode::Bm25Only => {
+                // Bm25Only requires bm25_score
+                let bm25_score = bm25_raw?;
+                Some(ScoreBreakdown::Bm25Only { bm25_score })
+            }
+            SearchMode::Hybrid { alpha } => {
+                // Normalize vector score: None -> 0.0, Some(d) -> normalized similarity
+                let vector_score = distance.map_or(0.0, |d| {
+                    if normalization.max_distance > normalization.min_distance {
+                        1.0 - ((d - normalization.min_distance)
+                            / (normalization.max_distance - normalization.min_distance))
+                            as f64
+                    } else {
+                        1.0 - d as f64
+                    }
+                });
+
+                // Normalize BM25 score: None -> 0.0, Some(s) -> normalized score
+                let bm25_normalized = bm25_raw.map_or(0.0, |s| {
+                    if normalization.max_bm25 > 0.0 {
+                        s / normalization.max_bm25
+                    } else {
+                        0.0
+                    }
+                });
+
+                // Compute hybrid score
+                let hybrid_score = alpha * vector_score + (1.0 - alpha) * bm25_normalized;
+
+                Some(ScoreBreakdown::Hybrid {
+                    distance,
+                    bm25_score: bm25_raw,
+                    hybrid_score,
+                })
+            }
+        }
     }
 }
