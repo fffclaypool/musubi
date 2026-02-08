@@ -14,6 +14,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     pkg-config \
     libssl-dev \
+    libhdf5-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Rust toolchain
