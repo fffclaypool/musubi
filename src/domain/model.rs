@@ -192,6 +192,11 @@ mod optional_naive_date {
     }
 }
 
+/// Default value for indexed field (true for backwards compatibility)
+fn default_indexed() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredRecord {
     #[serde(flatten)]
@@ -200,6 +205,28 @@ pub struct StoredRecord {
     /// Tombstone flag for soft deletion. Defaults to false for backwards compatibility.
     #[serde(default)]
     pub deleted: bool,
+    /// SHA-256 hash of normalized content for differential sync
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_hash: Option<String>,
+    /// Whether this record has been embedded and indexed (searchable).
+    /// Defaults to true for backwards compatibility with existing data.
+    #[serde(default = "default_indexed")]
+    pub indexed: bool,
+    /// Explicit text for embedding (if provided, used instead of title+body).
+    /// Stored to ensure consistent hash calculation and embedding across sync cycles.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embed_text: Option<String>,
+}
+
+/// A pending document waiting to be synced (not yet in records/index)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingDocument {
+    /// The record data
+    pub record: Record,
+    /// SHA-256 hash of normalized content
+    pub content_hash: String,
+    /// Explicit text for embedding (if provided)
+    pub embed_text: Option<String>,
 }
 
 impl StoredRecord {
@@ -208,6 +235,9 @@ impl StoredRecord {
             record,
             embedding,
             deleted: false,
+            content_hash: None,
+            indexed: true,
+            embed_text: None,
         }
     }
 
@@ -216,6 +246,21 @@ impl StoredRecord {
             record,
             embedding,
             deleted,
+            content_hash: None,
+            indexed: true,
+            embed_text: None,
+        }
+    }
+
+    /// Create a pending record (indexed=false) for batch ingestion
+    pub fn pending(record: Record, content_hash: String, embed_text: Option<String>) -> Self {
+        Self {
+            record,
+            embedding: Vec::new(),
+            deleted: false,
+            content_hash: Some(content_hash),
+            indexed: false,
+            embed_text,
         }
     }
 }

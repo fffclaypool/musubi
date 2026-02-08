@@ -1,11 +1,13 @@
 //! Core DocumentService struct definition and private helpers.
 
+use std::collections::HashMap;
+use std::path::PathBuf;
+
 use crate::application::error::AppError;
-use crate::domain::model::StoredRecord;
-use crate::domain::ports::{Embedder, RecordStore, VectorIndex, VectorIndexFactory};
+use crate::domain::model::{PendingDocument, StoredRecord};
+use crate::domain::ports::{Embedder, PendingStore, RecordStore, VectorIndex, VectorIndexFactory};
 use crate::infrastructure::search::Bm25Index;
 use crate::infrastructure::storage::wal::{WalConfig, WalWriter};
-use std::path::PathBuf;
 
 use super::types::{ChunkConfig, IndexingMode, TombstonePolicy};
 
@@ -27,17 +29,14 @@ pub struct DocumentService {
     pub(super) indexing_mode: IndexingMode,
     #[allow(dead_code)]
     pub(super) chunk_config: ChunkConfig,
+    /// Pending documents waiting to be synced (keyed by ID).
+    /// These are NOT in records/index until sync completes.
+    pub(super) pending_queue: HashMap<String, PendingDocument>,
+    /// Optional persistent store for pending documents
+    pub(super) pending_store: Option<Box<dyn PendingStore>>,
 }
 
 impl DocumentService {
-    /// Find the index of a record by ID.
-    pub(super) fn find_index(&self, id: &str) -> Result<usize, AppError> {
-        self.records
-            .iter()
-            .position(|record| record.record.id == id && !record.deleted)
-            .ok_or_else(|| AppError::NotFound("record not found".to_string()))
-    }
-
     /// Embed a single text string.
     pub(super) fn embed_single(&self, text: String) -> Result<Vec<f32>, AppError> {
         self.embedder

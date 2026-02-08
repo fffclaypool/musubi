@@ -1,14 +1,11 @@
-use chrono::NaiveDate;
-
 use crate::application::error::AppError;
 use crate::application::service::{
-    DocumentRead, DocumentResponse, DocumentSearch, DocumentService, DocumentSummary,
-    DocumentWrite, InsertCommand, InsertResult, SearchHit, SearchRequest, SearchValidationError,
-    Tag, UpdateCommand, ValidatedSearchQuery,
+    job_store::JobStore, run_sync, BatchDocument, BatchInsertResult, DocumentDefaults,
+    DocumentIngestion, DocumentSearch, DocumentService, IngestionJob, JobProgress, JobStatus,
+    LastSyncInfo, SearchHit, SearchRequest, SearchValidationError, ValidatedSearchQuery,
 };
-use crate::domain::model::Record;
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Path, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -17,49 +14,17 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::io;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 #[derive(Clone)]
 struct AppState {
     service: Arc<RwLock<DocumentService>>,
+    job_store: Arc<Mutex<JobStore>>,
 }
 
 #[derive(Debug, Deserialize)]
-struct InsertRequest {
-    id: String,
-    title: Option<String>,
-    body: Option<String>,
-    source: Option<String>,
-    updated_at: Option<NaiveDate>,
-    #[serde(default)]
-    tags: Vec<Tag>,
-    text: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct UpdateRequest {
-    title: Option<String>,
-    body: Option<String>,
-    source: Option<String>,
-    updated_at: Option<NaiveDate>,
-    tags: Option<Vec<Tag>>,
-    text: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct EmbedRequest {
-    texts: Vec<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ListQuery {
-    limit: Option<usize>,
-    offset: Option<usize>,
-}
-
-#[derive(Debug, Serialize)]
-struct EmbedResponse {
-    embeddings: Vec<Vec<f32>>,
+struct BatchInsertRequest {
+    documents: Vec<BatchDocument>,
 }
 
 #[derive(Debug, Serialize)]
@@ -68,9 +33,8 @@ struct SearchResponse {
 }
 
 #[derive(Debug, Serialize)]
-struct ListResponse {
-    total: usize,
-    items: Vec<DocumentSummary>,
+struct StartJobResponse {
+    job_id: String,
 }
 
 #[derive(Debug)]
@@ -118,83 +82,129 @@ impl IntoResponse for ApiError {
     }
 }
 
-async fn insert_handler(
+// POST /documents/batch - Batch insert documents as pending
+async fn batch_insert_handler(
     State(state): State<AppState>,
-    Json(req): Json<InsertRequest>,
-) -> Result<Json<InsertResult>, ApiError> {
-    let record = Record {
-        id: req.id,
-        title: req.title,
-        body: req.body,
-        source: req.source,
-        updated_at: req.updated_at,
-        tags: req.tags,
-    };
-    let cmd = InsertCommand {
-        record,
-        text: req.text,
-    };
-
+    Json(req): Json<BatchInsertRequest>,
+) -> Result<Json<BatchInsertResult>, ApiError> {
     let state = state.clone();
     let result = tokio::task::spawn_blocking(move || {
         let mut guard = state.service.blocking_write();
-        guard.insert(cmd).map_err(ApiError::from)
+        guard.batch_insert(req.documents)
     })
     .await
     .map_err(|err| ApiError {
         status: StatusCode::INTERNAL_SERVER_ERROR,
         message: format!("join error: {}", err),
-    })??;
+    })?
+    .map_err(ApiError::from)?;
 
     Ok(Json(result))
 }
 
-async fn update_handler(
+// POST /ingestion/jobs - Start a sync job
+async fn start_ingestion_handler(
     State(state): State<AppState>,
-    Path(id): Path<String>,
-    Json(req): Json<UpdateRequest>,
-) -> Result<Json<DocumentResponse>, ApiError> {
-    let cmd = UpdateCommand {
-        title: req.title,
-        body: req.body,
-        source: req.source,
-        updated_at: req.updated_at,
-        tags: req.tags,
-        text: req.text,
+) -> Result<Json<StartJobResponse>, ApiError> {
+    // Check and create in a single lock to prevent race condition
+    let (job_id, job_arc) = {
+        let mut job_store = state.job_store.lock().await;
+        if job_store.has_running_job().await {
+            return Err(ApiError {
+                status: StatusCode::CONFLICT,
+                message: "a sync job is already running".to_string(),
+            });
+        }
+        job_store.create_job()
     };
 
-    let state = state.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        let mut guard = state.service.blocking_write();
-        guard.update(&id, cmd).map_err(ApiError::from)
-    })
-    .await
-    .map_err(|err| ApiError {
-        status: StatusCode::INTERNAL_SERVER_ERROR,
-        message: format!("join error: {}", err),
-    })??;
+    let response_job_id = job_id.clone();
+    let service = Arc::clone(&state.service);
+    let job_store = Arc::clone(&state.job_store);
 
-    Ok(Json(result))
-}
-
-async fn delete_handler(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> Result<StatusCode, ApiError> {
-    let state = state.clone();
+    // Spawn the sync job in the background
     tokio::task::spawn_blocking(move || {
-        let mut guard = state.service.blocking_write();
-        guard.delete(&id).map_err(ApiError::from)
-    })
-    .await
-    .map_err(|err| ApiError {
-        status: StatusCode::INTERNAL_SERVER_ERROR,
-        message: format!("join error: {}", err),
-    })??;
+        let mut guard = service.blocking_write();
 
-    Ok(StatusCode::NO_CONTENT)
+        // Get pending count for total
+        let pending_ids = guard.get_pending_ids();
+        let total = pending_ids.len();
+
+        // Update job with total
+        {
+            let job = job_arc.blocking_write();
+            let mut job = job;
+            job.progress.total = total;
+        }
+
+        // Run the sync with progress callback
+        let job_arc_for_callback = Arc::clone(&job_arc);
+        let result = run_sync(&mut guard, |progress: &JobProgress| {
+            let job = job_arc_for_callback.blocking_write();
+            let mut job = job;
+            job.progress = progress.clone();
+        });
+
+        // Update job status based on result
+        {
+            let job = job_arc.blocking_write();
+            let mut job = job;
+            match result {
+                Ok(final_progress) => {
+                    job.progress = final_progress;
+                    job.status = JobStatus::Ready;
+                }
+                Err(e) => {
+                    job.status = JobStatus::Failed {
+                        error: e.to_string(),
+                    };
+                }
+            }
+            job.completed_at = Some(chrono::Utc::now());
+        }
+
+        // Mark job as completed in store
+        let job_store = job_store.blocking_lock();
+        let mut job_store = job_store;
+        job_store.mark_completed(&job_id);
+    });
+
+    Ok(Json(StartJobResponse {
+        job_id: response_job_id,
+    }))
 }
 
+// GET /ingestion/jobs/:id - Get job status
+async fn get_job_status_handler(
+    State(state): State<AppState>,
+    Path(job_id): Path<String>,
+) -> Result<Json<IngestionJob>, ApiError> {
+    let job_store = state.job_store.lock().await;
+
+    let job_arc = job_store.get_job(&job_id).ok_or_else(|| ApiError {
+        status: StatusCode::NOT_FOUND,
+        message: "job not found".to_string(),
+    })?;
+
+    let job = job_arc.read().await;
+    Ok(Json(job.clone()))
+}
+
+// GET /ingestion/last - Get last sync info
+async fn get_last_sync_handler(
+    State(state): State<AppState>,
+) -> Result<Json<LastSyncInfo>, ApiError> {
+    let job_store = state.job_store.lock().await;
+
+    let last_sync = job_store.get_last_sync().await.ok_or_else(|| ApiError {
+        status: StatusCode::NOT_FOUND,
+        message: "no completed sync found".to_string(),
+    })?;
+
+    Ok(Json(last_sync))
+}
+
+// POST /search - Search indexed documents
 async fn search_handler(
     State(state): State<AppState>,
     Json(req): Json<SearchRequest>,
@@ -215,63 +225,7 @@ async fn search_handler(
     Ok(Json(SearchResponse { results }))
 }
 
-async fn embed_handler(
-    State(state): State<AppState>,
-    Json(req): Json<EmbedRequest>,
-) -> Result<Json<EmbedResponse>, ApiError> {
-    let state = state.clone();
-    let embeddings = tokio::task::spawn_blocking(move || {
-        let guard = state.service.blocking_read();
-        guard.embed_texts(req.texts).map_err(ApiError::from)
-    })
-    .await
-    .map_err(|err| ApiError {
-        status: StatusCode::INTERNAL_SERVER_ERROR,
-        message: format!("join error: {}", err),
-    })??;
-
-    Ok(Json(EmbedResponse { embeddings }))
-}
-
-async fn get_document_handler(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> Result<Json<DocumentResponse>, ApiError> {
-    let state = state.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        let guard = state.service.blocking_read();
-        guard.get(&id).map_err(ApiError::from)
-    })
-    .await
-    .map_err(|err| ApiError {
-        status: StatusCode::INTERNAL_SERVER_ERROR,
-        message: format!("join error: {}", err),
-    })??;
-
-    Ok(Json(result))
-}
-
-async fn list_documents_handler(
-    State(state): State<AppState>,
-    Query(query): Query<ListQuery>,
-) -> Result<Json<ListResponse>, ApiError> {
-    let limit = query.limit.unwrap_or(20).min(200);
-    let offset = query.offset.unwrap_or(0);
-
-    let state = state.clone();
-    let (total, items) = tokio::task::spawn_blocking(move || {
-        let guard = state.service.blocking_read();
-        guard.list(offset, limit)
-    })
-    .await
-    .map_err(|err| ApiError {
-        status: StatusCode::INTERNAL_SERVER_ERROR,
-        message: format!("join error: {}", err),
-    })?;
-
-    Ok(Json(ListResponse { total, items }))
-}
-
+// GET /health - Health check
 async fn health_handler() -> &'static str {
     "ok"
 }
@@ -279,21 +233,15 @@ async fn health_handler() -> &'static str {
 pub async fn serve(addr: String, service: DocumentService) -> io::Result<()> {
     let state = AppState {
         service: Arc::new(RwLock::new(service)),
+        job_store: Arc::new(Mutex::new(JobStore::new())),
     };
 
     let app = Router::new()
         .route("/health", get(health_handler))
-        .route("/embed", post(embed_handler))
-        .route(
-            "/documents",
-            post(insert_handler).get(list_documents_handler),
-        )
-        .route(
-            "/documents/:id",
-            get(get_document_handler)
-                .put(update_handler)
-                .delete(delete_handler),
-        )
+        .route("/documents/batch", post(batch_insert_handler))
+        .route("/ingestion/jobs", post(start_ingestion_handler))
+        .route("/ingestion/jobs/:id", get(get_job_status_handler))
+        .route("/ingestion/last", get(get_last_sync_handler))
         .route("/search", post(search_handler))
         .with_state(state);
 

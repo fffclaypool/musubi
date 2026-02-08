@@ -52,3 +52,19 @@ pub trait ChunkStore: Send + Sync {
     /// Get the storage path
     fn path(&self) -> &Path;
 }
+
+use crate::domain::model::PendingDocument;
+
+/// Trait for storing pending documents awaiting sync
+pub trait PendingStore: Send + Sync {
+    /// Load all pending documents
+    fn load(&self) -> io::Result<Vec<(String, PendingDocument)>>;
+    /// Save all pending documents (overwrites existing)
+    fn save_all(&self, pending: &[(String, PendingDocument)]) -> io::Result<()>;
+    /// Append or update a single pending document
+    fn upsert(&self, id: &str, doc: &PendingDocument) -> io::Result<()>;
+    /// Delete a pending document by ID
+    fn delete(&self, id: &str) -> io::Result<()>;
+    /// Get the storage path
+    fn path(&self) -> &Path;
+}

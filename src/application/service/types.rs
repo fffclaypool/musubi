@@ -145,22 +145,8 @@ pub struct ServiceConfig {
     pub wal_config: Option<crate::infrastructure::storage::wal::WalConfig>,
     pub tombstone_config: TombstoneConfig,
     pub chunk_config: ChunkConfig,
-}
-
-#[derive(Debug, Clone)]
-pub struct InsertCommand {
-    pub record: Record,
-    pub text: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-pub struct UpdateCommand {
-    pub title: Option<String>,
-    pub body: Option<String>,
-    pub source: Option<String>,
-    pub updated_at: Option<NaiveDate>,
-    pub tags: Option<Vec<Tag>>,
-    pub text: Option<String>,
+    /// Path to the pending documents store (optional, enables persistence)
+    pub pending_store_path: Option<std::path::PathBuf>,
 }
 
 /// Tag filter mode for SearchFilter (uses HashSet for O(1) matching)
@@ -531,34 +517,107 @@ pub struct SearchHit {
     pub best_chunk: Option<ChunkInfo>,
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct InsertResult {
-    pub index_id: usize,
+// ========================================
+// Batch Ingestion & Sync Job Types
+// ========================================
+
+// Note: PendingDocument is defined in crate::domain::model
+
+/// Status of an ingestion job
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum JobStatus {
+    /// Job is currently processing
+    Processing,
+    /// Job completed successfully
+    Ready,
+    /// Job failed with an error
+    Failed { error: String },
+}
+
+/// Progress tracking for an ingestion job
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct JobProgress {
+    /// Total number of documents to process
+    pub total: usize,
+    /// Number of documents processed so far
+    pub processed: usize,
+    /// Number of documents that were embedded (content changed)
+    pub indexed: usize,
+    /// Number of documents that were skipped (content unchanged)
+    pub skipped: usize,
+    /// Number of documents that failed to process
+    pub failed: usize,
+}
+
+/// A document in a batch insert request
+#[derive(Debug, Clone, Deserialize)]
+pub struct BatchDocument {
+    /// Document ID (required, must be non-empty)
     pub id: String,
-    pub dim: usize,
+    /// Document title
+    pub title: Option<String>,
+    /// Document body
+    pub body: Option<String>,
+    /// Document source
+    pub source: Option<String>,
+    /// Date when the document was last updated
+    #[serde(default)]
+    pub updated_at: Option<NaiveDate>,
+    /// Tags associated with the document
+    #[serde(default)]
+    pub tags: Vec<Tag>,
+    /// Explicit text for embedding (uses title+body if None)
+    pub text: Option<String>,
 }
 
+/// Result of a batch insert operation
 #[derive(Debug, Clone, Serialize)]
-pub struct DocumentSummary {
-    pub index_id: usize,
-    #[serde(flatten)]
-    pub record: Record,
+pub struct BatchInsertResult {
+    /// Number of documents accepted
+    pub accepted: usize,
+    /// Number of documents that failed validation
+    pub failed: usize,
+    /// Details of validation errors
+    pub errors: Vec<BatchError>,
 }
 
+/// Error for a single document in a batch
 #[derive(Debug, Clone, Serialize)]
-pub struct DocumentResponse {
-    pub index_id: usize,
-    #[serde(flatten)]
-    pub record: Record,
-    pub embedding: Vec<f32>,
+pub struct BatchError {
+    /// Document ID (or position if ID was missing)
+    pub id: String,
+    /// Error message
+    pub error: String,
 }
 
-/// Internal enum representing the effect of an update operation
-pub(super) enum UpdateEffect {
-    /// Only metadata changed, no re-embedding needed
-    MetadataOnly,
-    /// Content changed, re-embedding required
-    ContentChanged { text: String },
+/// An ingestion job instance
+#[derive(Debug, Clone, Serialize)]
+pub struct IngestionJob {
+    /// Unique job ID
+    pub id: String,
+    /// Current job status
+    pub status: JobStatus,
+    /// Job progress
+    pub progress: JobProgress,
+    /// When the job was started
+    pub started_at: chrono::DateTime<chrono::Utc>,
+    /// When the job completed (if finished)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Response for the last sync info endpoint
+#[derive(Debug, Clone, Serialize)]
+pub struct LastSyncInfo {
+    /// Job ID of the last completed sync
+    pub job_id: String,
+    /// Status of the last sync (should be Ready or Failed)
+    pub status: JobStatus,
+    /// Final progress of the last sync
+    pub progress: JobProgress,
+    /// When the sync completed
+    pub completed_at: chrono::DateTime<chrono::Utc>,
 }
 
 use std::collections::HashMap as StdHashMap;

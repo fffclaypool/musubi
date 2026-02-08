@@ -2,7 +2,9 @@
 
 use crate::application::error::AppError;
 use crate::domain::model::StoredChunk;
-use crate::domain::ports::{ChunkStore, Chunker, Embedder, RecordStore, VectorIndexFactory};
+use crate::domain::ports::{
+    ChunkStore, Chunker, Embedder, PendingStore, RecordStore, VectorIndexFactory,
+};
 use crate::infrastructure::search::Bm25Index;
 use crate::infrastructure::storage::wal::{self, WalWriter};
 
@@ -21,6 +23,7 @@ impl DocumentService {
         index_factory: Box<dyn VectorIndexFactory>,
         chunker: Option<Box<dyn Chunker>>,
         chunk_store: Option<Box<dyn ChunkStore>>,
+        pending_store: Option<Box<dyn PendingStore>>,
     ) -> Result<Self, AppError> {
         // Convert tombstone config to policy (validates and rejects conflicting settings)
         let tombstone_policy = config
@@ -134,22 +137,34 @@ impl DocumentService {
                         index.len()
                     )));
                 }
-            } else if !records.is_empty() && records.len() != index.len() {
-                // Non-chunking mode: check records count
-                return Err(AppError::Io(format!(
-                    "records count ({}) does not match index count ({})",
-                    records.len(),
-                    index.len()
-                )));
+            } else {
+                // Non-chunking mode: count only indexed non-deleted records with embeddings
+                // Pending records (indexed=false) don't have embeddings and aren't in the index
+                let indexed_record_count = records
+                    .iter()
+                    .filter(|r| r.indexed && !r.deleted && !r.embedding.is_empty())
+                    .count();
+                if indexed_record_count != index.len() {
+                    return Err(AppError::Io(format!(
+                        "indexed records count ({}) does not match index count ({})",
+                        indexed_record_count,
+                        index.len()
+                    )));
+                }
             }
         }
 
-        // Build BM25 index from records (excluding tombstones, always document-level)
+        // Build BM25 index from indexed records (excluding tombstones and pending, always document-level)
         let mut bm25_index = Bm25Index::new();
         for (idx, record) in records.iter().enumerate() {
-            if !record.deleted {
-                if let Some(text) = build_text(None, &record.record) {
-                    bm25_index.add(idx, &text);
+            if !record.deleted && record.indexed {
+                // Use embed_text if available, otherwise derive from title+body
+                let text = record
+                    .embed_text
+                    .clone()
+                    .or_else(|| build_text(None, &record.record));
+                if let Some(t) = text {
+                    bm25_index.add(idx, &t);
                 }
             }
         }
@@ -176,6 +191,13 @@ impl DocumentService {
             _ => IndexingMode::Direct,
         };
 
+        // Load pending documents from store if available
+        let pending_queue = if let Some(ref ps) = pending_store {
+            ps.load()?.into_iter().collect()
+        } else {
+            std::collections::HashMap::new()
+        };
+
         // After successful load, save snapshot and truncate WAL
         let mut service = Self {
             index,
@@ -193,6 +215,8 @@ impl DocumentService {
             bm25_index,
             indexing_mode,
             chunk_config: config.chunk_config,
+            pending_queue,
+            pending_store,
         };
 
         // Perform migration if needed (chunking enabled but no chunks exist)

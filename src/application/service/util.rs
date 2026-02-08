@@ -1,5 +1,7 @@
 //! Utility functions for the document service.
 
+use sha2::{Digest, Sha256};
+
 use crate::domain::model::{Record, StoredChunk, StoredRecord};
 use crate::domain::ports::VectorIndex;
 use std::collections::HashMap;
@@ -99,5 +101,139 @@ pub(super) fn create_text_preview(text: &str, max_len: usize) -> String {
         } else {
             format!("{}...", truncated)
         }
+    }
+}
+
+/// Calculate content hash with strict normalization for differential sync.
+///
+/// Normalization rules:
+/// 1. title: trimmed, empty string if None
+/// 2. body: trimmed, empty string if None
+/// 3. text: trimmed, empty string if None (explicit embedding text)
+/// 4. tags: lowercase, sorted alphabetically, joined with ","
+/// 5. updated_at: "YYYY-MM-DD" or empty string
+/// 6. Concatenate: "{title}\x00{body}\x00{text}\x00{tags}\x00{updated_at}"
+/// 7. Hash: SHA-256, hex-encoded lowercase
+pub fn calculate_content_hash(record: &Record, text: Option<&str>) -> String {
+    let mut hasher = Sha256::new();
+
+    // 1. title (trimmed, empty if None)
+    let title = record.title.as_deref().unwrap_or("").trim();
+    hasher.update(title.as_bytes());
+    hasher.update(b"\x00");
+
+    // 2. body (trimmed, empty if None)
+    let body = record.body.as_deref().unwrap_or("").trim();
+    hasher.update(body.as_bytes());
+    hasher.update(b"\x00");
+
+    // 3. text (trimmed, empty if None)
+    let text_val = text.unwrap_or("").trim();
+    hasher.update(text_val.as_bytes());
+    hasher.update(b"\x00");
+
+    // 4. tags (lowercase, sorted, comma-joined)
+    let mut tags: Vec<&str> = record.tags.iter().map(|t| t.as_str()).collect();
+    tags.sort();
+    hasher.update(tags.join(",").as_bytes());
+    hasher.update(b"\x00");
+
+    // 5. updated_at (YYYY-MM-DD or empty)
+    if let Some(date) = record.updated_at {
+        hasher.update(date.format("%Y-%m-%d").to_string().as_bytes());
+    }
+
+    format!("{:x}", hasher.finalize())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::model::Tag;
+    use chrono::NaiveDate;
+
+    #[test]
+    fn test_content_hash_deterministic() {
+        let record = Record {
+            id: "test".to_string(),
+            title: Some("Title".to_string()),
+            body: Some("Body".to_string()),
+            source: None,
+            updated_at: Some(NaiveDate::from_ymd_opt(2024, 6, 15).unwrap()),
+            tags: vec![Tag::new("rust"), Tag::new("ai")],
+        };
+
+        let hash1 = calculate_content_hash(&record, None);
+        let hash2 = calculate_content_hash(&record, None);
+        assert_eq!(hash1, hash2);
+    }
+
+    #[test]
+    fn test_content_hash_tag_order_independent() {
+        let record1 = Record {
+            id: "test".to_string(),
+            title: Some("Title".to_string()),
+            body: None,
+            source: None,
+            updated_at: None,
+            tags: vec![Tag::new("rust"), Tag::new("ai")],
+        };
+
+        let record2 = Record {
+            id: "test".to_string(),
+            title: Some("Title".to_string()),
+            body: None,
+            source: None,
+            updated_at: None,
+            tags: vec![Tag::new("ai"), Tag::new("rust")],
+        };
+
+        assert_eq!(
+            calculate_content_hash(&record1, None),
+            calculate_content_hash(&record2, None)
+        );
+    }
+
+    #[test]
+    fn test_content_hash_whitespace_normalized() {
+        let record1 = Record {
+            id: "test".to_string(),
+            title: Some("  Title  ".to_string()),
+            body: Some("  Body  ".to_string()),
+            source: None,
+            updated_at: None,
+            tags: vec![],
+        };
+
+        let record2 = Record {
+            id: "test".to_string(),
+            title: Some("Title".to_string()),
+            body: Some("Body".to_string()),
+            source: None,
+            updated_at: None,
+            tags: vec![],
+        };
+
+        assert_eq!(
+            calculate_content_hash(&record1, None),
+            calculate_content_hash(&record2, None)
+        );
+    }
+
+    #[test]
+    fn test_content_hash_explicit_text() {
+        let record = Record {
+            id: "test".to_string(),
+            title: Some("Title".to_string()),
+            body: None,
+            source: None,
+            updated_at: None,
+            tags: vec![],
+        };
+
+        let hash_without_text = calculate_content_hash(&record, None);
+        let hash_with_text = calculate_content_hash(&record, Some("explicit text"));
+
+        assert_ne!(hash_without_text, hash_with_text);
     }
 }

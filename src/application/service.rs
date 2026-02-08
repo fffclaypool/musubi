@@ -6,14 +6,16 @@
 //! - `types`: Type definitions for commands, responses, and configuration
 //! - `core`: Core DocumentService struct definition
 //! - `load`: Service loading and migration operations
-//! - `write`: Write operations (insert, update, delete)
+//! - `ingestion`: Batch ingestion and differential sync operations
 //! - `search`: Search operations
-//! - `read`: Read operations (get, list, embed, import)
 //! - `compaction`: Compaction and WAL rotation operations
+//! - `job_store`: In-memory job state management
 //! - `util`: Internal utility functions
 
 mod compaction;
 mod core;
+pub mod ingestion;
+pub mod job_store;
 mod load;
 mod read;
 mod search;
@@ -27,10 +29,10 @@ mod tests;
 
 // Re-export public types
 pub use types::{
-    ChunkConfig, ChunkInfo, DocumentResponse, DocumentSummary, InsertCommand, InsertResult,
-    SearchFilter, SearchHit, SearchInput, SearchMode, SearchParams, SearchRequest,
-    SearchValidationError, ServiceConfig, TagFilter, TombstoneConfig, TombstonePolicy,
-    UpdateCommand, ValidatedSearchQuery,
+    BatchDocument, BatchError, BatchInsertResult, ChunkConfig, ChunkInfo, IngestionJob,
+    JobProgress, JobStatus, LastSyncInfo, SearchFilter, SearchHit, SearchInput, SearchMode,
+    SearchParams, SearchRequest, SearchValidationError, ServiceConfig, TagFilter, TombstoneConfig,
+    TombstonePolicy, ValidatedSearchQuery,
 };
 
 // Re-export Tag from domain
@@ -40,4 +42,8 @@ pub use crate::domain::model::Tag;
 pub use core::DocumentService;
 
 // Re-export traits for trait-based polymorphism
-pub use traits::{DocumentRead, DocumentSearch, DocumentWrite};
+pub use traits::{DocumentDefaults, DocumentSearch};
+pub use ingestion::DocumentIngestion;
+
+// Re-export ingestion utilities
+pub use ingestion::{run_sync, ProcessResult};

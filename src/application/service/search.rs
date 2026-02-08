@@ -223,7 +223,7 @@ impl DocumentService {
             .filter(|&record_idx| {
                 self.records
                     .get(record_idx)
-                    .is_some_and(|r| !r.deleted && filter.is_none_or(|f| f.matches(&r.record)))
+                    .is_some_and(|r| !r.deleted && r.indexed && filter.is_none_or(|f| f.matches(&r.record)))
             })
             .collect()
     }
