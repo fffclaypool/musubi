@@ -17,6 +17,11 @@ target
 data/ann/
 data/bench/
 
+# Local data files
+data/records.jsonl
+data/pending.jsonl
+data/chunks.jsonl
+
 # RustRover
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
 #  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore

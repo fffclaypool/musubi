@@ -1,12 +1,13 @@
 use musubi::application::config::{AppConfig, ConfigError, EmbedderConfig};
 use musubi::application::error::AppError;
 use musubi::application::service::{ChunkConfig, DocumentService};
-use musubi::domain::ports::{ChunkStore, Chunker, Embedder};
+use musubi::domain::ports::{ChunkStore, Chunker, Embedder, PendingStore};
 use musubi::infrastructure::chunking::{FixedChunker, SemanticChunker};
 use musubi::infrastructure::embedding::http::HttpEmbedder;
 use musubi::infrastructure::embedding::python::PythonEmbedder;
 use musubi::infrastructure::index::adapter::HnswIndexFactory;
 use musubi::infrastructure::storage::chunk_store::JsonlChunkStore;
+use musubi::infrastructure::storage::pending_store::JsonlPendingStore;
 use musubi::infrastructure::storage::record_store::JsonlRecordStore;
 use musubi::interface::http::server::serve;
 use std::io;
@@ -14,6 +15,9 @@ use std::sync::Arc;
 
 /// Optional chunker and chunk store pair for document chunking
 type ChunkerPair = (Option<Box<dyn Chunker>>, Option<Box<dyn ChunkStore>>);
+
+/// Optional pending store for batch ingestion
+type MaybePendingStore = Option<Box<dyn PendingStore>>;
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
@@ -58,6 +62,13 @@ async fn main() -> io::Result<()> {
     let record_store = Box::new(JsonlRecordStore::new(config.records_path));
     let index_factory = Box::new(HnswIndexFactory::new(16, 200));
 
+    // Create pending store only when chunking is disabled
+    // (batch ingestion is not supported with chunking)
+    let pending_store: MaybePendingStore = match &config.chunk_config {
+        ChunkConfig::None => Some(Box::new(JsonlPendingStore::new(&config.pending_path))),
+        _ => None,
+    };
+
     let service = DocumentService::load(
         service_config,
         embedder_box,
@@ -65,6 +76,7 @@ async fn main() -> io::Result<()> {
         index_factory,
         chunker,
         chunk_store,
+        pending_store,
     )
     .map_err(map_app_error)?;
 

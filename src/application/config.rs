@@ -16,6 +16,8 @@ pub struct AppConfig {
     pub records_path: PathBuf,
     /// Path to chunks JSONL file
     pub chunks_path: PathBuf,
+    /// Path to pending documents JSONL file
+    pub pending_path: PathBuf,
     /// WAL configuration (None if disabled)
     pub wal_config: Option<WalConfig>,
     /// Tombstone compaction configuration
@@ -90,6 +92,7 @@ impl AppConfig {
         let snapshot_path = PathBuf::from("hnsw.bin");
         let records_path = PathBuf::from("data/records.jsonl");
         let chunks_path = PathBuf::from("data/chunks.jsonl");
+        let pending_path = PathBuf::from("data/pending.jsonl");
 
         let wal_config = Self::parse_wal_config();
         let tombstone_config = Self::parse_tombstone_config()?;
@@ -101,6 +104,7 @@ impl AppConfig {
             snapshot_path,
             records_path,
             chunks_path,
+            pending_path,
             wal_config,
             tombstone_config,
             chunk_config,
@@ -117,6 +121,7 @@ impl AppConfig {
             wal_config: self.wal_config.clone(),
             tombstone_config: self.tombstone_config.clone(),
             chunk_config: self.chunk_config.clone(),
+            pending_store_path: Some(self.pending_path.clone()),
         }
     }
 

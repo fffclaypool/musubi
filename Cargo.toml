@@ -13,6 +13,8 @@ chrono = { version = "0.4", features = ["serde"] }
 axum = "0.7"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 reqwest = { version = "0.12", features = ["blocking", "json"] }
+sha2 = "0.10"
+uuid = { version = "1", features = ["v4"] }
 
 # Benchmark dependencies
 hdf5 = "0.8"
