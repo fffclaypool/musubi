@@ -22,6 +22,23 @@ make run-embed
 make run-api
 ```
 
+## Docker
+
+同一イメージから API サーバー (`./target/release/musubi`) と embedding サーバー (`uv run python/embedding_server.py`) の両方を起動できます。
+
+```bash
+# Build
+docker build -t musubi:local .
+
+# API server (port 8080)
+docker run --rm -p 8080:8080 musubi:local
+
+# Embedding server (port 8081)
+docker run --rm -p 8081:8081 musubi:local uv run python/embedding_server.py
+```
+
+Dockerfile は `EXPOSE 8080 8081` を設定しています。
+
 ## 使い方
 
 ### 1) バッチ投入
