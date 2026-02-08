@@ -29,10 +29,10 @@ COPY Cargo.toml Cargo.lock ./
 # Build Python env at image build time (required)
 RUN uv sync --frozen
 
-# Copy source and build Rust binary at image build time (required)
+# Copy source and build Rust API binary at image build time (required)
 COPY src ./src
 COPY python ./python
-RUN cargo build --release
+RUN cargo build --release --bin musubi
 
 
 FROM ubuntu:22.04 AS runtime
