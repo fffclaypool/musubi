@@ -19,7 +19,8 @@
         "serayuzgur.crates",
         "usernamehw.errorlens",
         "ms-python.python",
-        "ms-python.vscode-pylance"
+        "ms-python.vscode-pylance",
+        "openai.chatgpt"
       ]
     }
   },
