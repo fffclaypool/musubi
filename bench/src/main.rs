@@ -9,7 +9,7 @@
 
 use clap::Parser;
 use hdf5::File as H5File;
-use musubi::infrastructure::index::hnsw::HnswIndex;
+use musubi::HnswIndex;
 use ndarray::Array2;
 use serde::Serialize;
 use std::collections::HashSet;

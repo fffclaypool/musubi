@@ -1,7 +1,7 @@
-use crate::domain::types::{SearchResult, Vector};
-use crate::infrastructure::index::metrics::{cosine_distance, normalize};
-use crate::infrastructure::index::neighbor::select_neighbors_heuristic;
-use crate::infrastructure::storage::file as storage_file;
+use crate::metrics::{cosine_distance, normalize};
+use crate::neighbor::select_neighbors_heuristic;
+use crate::snapshot as storage_file;
+use crate::types::{SearchResult, Vector};
 use ordered_float::OrderedFloat;
 use rand::Rng;
 use std::collections::{BinaryHeap, HashSet};

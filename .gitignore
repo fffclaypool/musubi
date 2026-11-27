@@ -21,6 +21,11 @@ data/bench/
 data/records.jsonl
 data/pending.jsonl
 data/chunks.jsonl
+data/embeddings.jsonl
+
+# Index snapshots
+*.bin
+*.wal
 
 # RustRover
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can

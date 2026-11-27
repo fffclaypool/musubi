@@ -1,13 +1,10 @@
 [project]
 name = "musubi"
 version = "0.1.0"
-description = "Python dependencies for embedding tools"
+description = "Python dependencies for generating example embeddings"
 requires-python = ">=3.10"
 dependencies = [
   "sentence-transformers>=2.2.0",
-  "fastapi>=0.100.0",
-  "uvicorn>=0.20.0",
-  "pydantic>=2.0.0",
 ]
 
 [dependency-groups]
