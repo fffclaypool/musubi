@@ -1,4 +1,4 @@
-use crate::infrastructure::index::hnsw::HnswIndex;
+use crate::hnsw::HnswIndex;
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::Path;
@@ -34,8 +34,7 @@ pub fn save<P: AsRef<Path>>(index: &HnswIndex, path: P) -> io::Result<()> {
         write_u32(&mut writer, level as u32)?;
     }
 
-    for level in 0..=index.max_level {
-        let layer = &index.layers[level];
+    for layer in index.layers.iter().take(index.max_level + 1) {
         write_u32(&mut writer, layer.len() as u32)?;
         for neighbors in layer {
             write_u32(&mut writer, neighbors.len() as u32)?;

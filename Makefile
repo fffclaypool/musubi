@@ -1,82 +1,71 @@
-.PHONY: all build install run run-embed run-api dev clean test bench bench-download help
+.PHONY: all build test lint fmt example example-docs install bench-download bench bench-full clean help
 
 # Default target
 all: build
 
-# Build Rust binary
+# Build the library
 build:
 	cargo build --release
-
-# Install Python dependencies
-install:
-	uv sync
-
-# Run embedding server (pre-loads model)
-run-embed:
-	uv run python/embedding_server.py
-
-# Run API server (uses HTTP embedder)
-run-api:
-	MUSUBI_EMBED_URL=http://127.0.0.1:8081/embed cargo run --release
-
-# Run API server with Python embedder (no pre-loading)
-run-api-python:
-	cargo run --release
-
-# Development: run both servers (embedding first, then API)
-# Usage: make dev
-# Note: Run in separate terminals or use 'make run-embed' and 'make run-api' separately
-dev:
-	@echo "Start servers in separate terminals:"
-	@echo "  Terminal 1: make run-embed"
-	@echo "  Terminal 2: make run-api"
 
 # Run tests
 test:
 	cargo test
 
-# Clean build artifacts
-clean:
-	cargo clean
+# Format check + clippy (same as CI)
+lint:
+	cargo fmt --all --check
+	cargo clippy --all-targets -- -D warnings
+
+# Format code
+fmt:
+	cargo fmt --all
+
+# Random vectors: build an index and compare with brute force
+example:
+	cargo run --release --example basic
+
+# Install Python dependencies (only needed for example-docs)
+install:
+	uv sync
+
+# Embed data/sample.csv and search similar documents
+example-docs:
+	uv run python/embed_csv.py --input data/sample.csv --output data/embeddings.jsonl
+	cargo run --release --example similar_docs -- data/embeddings.jsonl
 
 # Download benchmark data
 bench-download:
 	./scripts/download_ann_data.sh
 
-# Run benchmark (10k subset)
+# Run benchmark (10k subset). Requires libhdf5-dev.
 bench:
-	cargo run --release --bin bench_ann -- \
+	cargo run --release -p musubi-bench --bin bench_ann -- \
 		--dataset data/ann/glove-100-angular.hdf5 \
 		--train-limit 10000 \
 		--test-limit 1000 \
 		--save-index
 
-# Run benchmark (full dataset)
+# Run benchmark (full dataset). Requires libhdf5-dev.
 bench-full:
-	cargo run --release --bin bench_ann -- \
+	cargo run --release -p musubi-bench --bin bench_ann -- \
 		--dataset data/ann/glove-100-angular.hdf5 \
 		--save-index
+
+# Clean build artifacts
+clean:
+	cargo clean
 
 # Show help
 help:
 	@echo "Available targets:"
-	@echo "  build         - Build Rust binary (release)"
-	@echo "  install       - Install Python dependencies"
-	@echo "  run-embed     - Start embedding server (port 8081)"
-	@echo "  run-api       - Start API server with HTTP embedder (port 8080)"
-	@echo "  run-api-python- Start API server with Python embedder (slower)"
-	@echo "  dev           - Show instructions for development setup"
-	@echo "  test          - Run tests"
-	@echo "  bench-download- Download ANN-Benchmarks data"
-	@echo "  bench         - Run benchmark (10k subset)"
-	@echo "  bench-full    - Run benchmark (full dataset)"
-	@echo "  clean         - Clean build artifacts"
-	@echo ""
-	@echo "Quick start:"
-	@echo "  1. make install"
-	@echo "  2. make run-embed  (terminal 1)"
-	@echo "  3. make run-api    (terminal 2)"
-	@echo ""
-	@echo "Benchmark:"
-	@echo "  1. make bench-download"
-	@echo "  2. make bench"
+	@echo "  build          - Build the library (release)"
+	@echo "  test           - Run tests"
+	@echo "  lint           - Format check + clippy"
+	@echo "  fmt            - Format code"
+	@echo "  example        - Run the basic example (random vectors)"
+	@echo "  install        - Install Python dependencies (for example-docs)"
+	@echo "  example-docs   - Embed data/sample.csv and find similar documents"
+	@echo "  bench-download - Download ANN-Benchmarks data"
+	@echo "  bench          - Run benchmark (10k subset, needs libhdf5-dev)"
+	@echo "  bench-full     - Run benchmark (full dataset, needs libhdf5-dev)"
+	@echo "  clean          - Clean build artifacts"
