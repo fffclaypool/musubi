@@ -11,7 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 musubi = { path = ".." }
-hdf5 = "0.8"
+hdf5 = { package = "hdf5-metno", version = "0.15" }
 ndarray = "0.15"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
